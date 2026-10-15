@@ -89,6 +89,9 @@ def process_trade_signal(
     tp: Optional[float],
     reason: str,
     timeframe: str = "5min",
+    tp1: Optional[float] = None,
+    tp2: Optional[float] = None,
+    tp3: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Main trade execution guard:
@@ -194,6 +197,34 @@ def process_trade_signal(
                 f"SL: {trade_sl:.3f}, TP: {trade_tp:.3f}."
             )
 
+        # Ensure consistent TP1, TP2, TP3 for the active position
+        actual_risk = max(abs(entry_price - trade_sl), 0.5)
+        tp1 = active_trade.get("tp1")
+        tp2 = active_trade.get("tp2") or trade_tp
+        tp3 = active_trade.get("tp3")
+
+        is_consistent = False
+        if tp1 is not None and tp2 is not None and tp3 is not None:
+            if direction == "BUY" and entry_price < tp1 < tp2 < tp3:
+                is_consistent = True
+            elif direction == "SELL" and entry_price > tp1 > tp2 > tp3:
+                is_consistent = True
+
+        if not is_consistent:
+            if direction == "BUY":
+                tp1 = round(entry_price + (actual_risk * 1.5), 3)
+                tp2 = round(trade_tp, 3) if trade_tp > tp1 else round(entry_price + (actual_risk * 2.0), 3)
+                tp3 = round(max(entry_price + (actual_risk * 3.0), tp2 + (actual_risk * 0.5)), 3)
+            else:
+                tp1 = round(entry_price - (actual_risk * 1.5), 3)
+                tp2 = round(trade_tp, 3) if trade_tp < tp1 else round(entry_price - (actual_risk * 2.0), 3)
+                tp3 = round(min(entry_price - (actual_risk * 3.0), tp2 - (actual_risk * 0.5)), 3)
+
+            active_trade["tp1"] = tp1
+            active_trade["tp2"] = tp2
+            active_trade["tp3"] = tp3
+            save_active_trade(active_trade)
+
         active_trade["current_price"] = current_price
         active_trade["unrealized_pnl_points"] = pnl_points
         active_trade["last_checked_at"] = now_utc
@@ -210,6 +241,9 @@ def process_trade_signal(
             "take_profit": trade_tp,
             "sl": trade_sl,
             "tp": trade_tp,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
             "unrealized_pnl_points": pnl_points,
             "active_position": active_trade,
             "message": message,
@@ -237,6 +271,10 @@ def process_trade_signal(
             }
 
         # Valid confirmed setup with SL and TP: OPEN NEW TRADE!
+        calc_tp1 = round(float(tp1), 3) if tp1 is not None else None
+        calc_tp2 = round(float(tp2), 3) if tp2 is not None else round(float(tp), 3)
+        calc_tp3 = round(float(tp3), 3) if tp3 is not None else None
+
         new_trade = {
             "id": f"trade_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
             "direction": signal,
@@ -245,6 +283,9 @@ def process_trade_signal(
             "take_profit": round(float(tp), 3),
             "sl": round(float(sl), 3),
             "tp": round(float(tp), 3),
+            "tp1": calc_tp1,
+            "tp2": calc_tp2,
+            "tp3": calc_tp3,
             "timeframe": timeframe,
             "entry_time": now_utc,
             "status": "OPEN",
@@ -253,11 +294,14 @@ def process_trade_signal(
 
         save_active_trade(new_trade)
         logger.info(
-            "Opened new %s position at %s | SL=%s | TP=%s",
+            "Opened new %s position at %s | SL=%s | TP=%s | TP1=%s | TP2=%s | TP3=%s",
             signal,
             current_price,
             sl,
             tp,
+            calc_tp1,
+            calc_tp2,
+            calc_tp3,
         )
 
         return {
@@ -272,6 +316,9 @@ def process_trade_signal(
             "take_profit": round(float(tp), 3),
             "sl": round(float(sl), 3),
             "tp": round(float(tp), 3),
+            "tp1": calc_tp1,
+            "tp2": calc_tp2,
+            "tp3": calc_tp3,
             "active_position": new_trade,
             "message": f"🚀 NEW ENTRY: {signal} confirmed at {current_price:.3f} with confirmed SL={float(sl):.3f} and TP={float(tp):.3f}.",
         }

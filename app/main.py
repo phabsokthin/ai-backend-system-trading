@@ -30,7 +30,14 @@ from app.trade_manager import (
 
 from app.live_market import market
 from pydantic import BaseModel, Field
-from app.mt5_bridge import send_order, get_account_summary, get_open_positions, close_position
+from app.mt5_bridge import (
+    send_order,
+    get_account_summary,
+    get_open_positions,
+    close_position,
+    get_mt5_live_tick,
+    get_mt5_candles,
+)
 
 load_dotenv()
 
@@ -118,7 +125,21 @@ def health():
 
 @app.get("/api/live-price")
 def get_live_price():
-    """Fast real-time price snapshot from Twelve Data WebSocket for Next.js tickers."""
+    """Fast real-time price snapshot from MT5 terminal or Twelve Data."""
+    mt5_tick = get_mt5_live_tick("XAUUSD")
+    if mt5_tick is not None:
+        return {
+            "success": True,
+            "symbol": "XAU/USD",
+            "price": mt5_tick["price"],
+            "bid": mt5_tick["bid"],
+            "ask": mt5_tick["ask"],
+            "status": "connected",
+            "source": "MetaTrader 5",
+            "last_tick_at": datetime.now(timezone.utc).isoformat(),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        }
+
     current_price = market.current_price
     if current_price is None:
         try:
@@ -132,6 +153,7 @@ def get_live_price():
         "symbol": "XAU/USD",
         "price": current_price,
         "status": market.connection_status,
+        "source": "Twelve Data",
         "last_tick_at": market.last_tick_at,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -141,17 +163,33 @@ def get_live_price():
 async def websocket_live_market(websocket: WebSocket):
     """
     Real-Time WebSocket Feed for Next.js:
-    Streams live XAU/USD price ticks directly to the frontend chart.
+    Streams live XAU/USD price ticks directly to the frontend chart from MT5 (or Twelve Data).
     """
     await websocket.accept()
     try:
         while True:
-            current_price = market.current_price
+            mt5_tick = get_mt5_live_tick("XAUUSD")
+            if mt5_tick is not None:
+                current_price = mt5_tick["price"]
+                status = "connected"
+                source = "MetaTrader 5"
+                bid = mt5_tick["bid"]
+                ask = mt5_tick["ask"]
+            else:
+                current_price = market.current_price
+                status = market.connection_status
+                source = "Twelve Data"
+                bid = current_price
+                ask = current_price
+
             await websocket.send_json({
                 "type": "tick",
                 "symbol": "XAU/USD",
                 "price": current_price,
-                "status": market.connection_status,
+                "bid": bid,
+                "ask": ask,
+                "status": status,
+                "source": source,
                 "last_tick_at": market.last_tick_at,
                 "timestamp": time.time(),
             })
@@ -167,14 +205,39 @@ async def websocket_live_market(websocket: WebSocket):
 def get_candles_for_nextjs(
     symbol: str = Query("XAU/USD", description="Symbol name, default XAU/USD"),
     interval: str = Query("5min", description="Timeframe interval: 5min, 15min, 1h, 4h, 1day"),
-    limit: int = Query(100, ge=1, le=500, description="Number of recent candlestick records, default 100"),
+    limit: int = Query(100, ge=1, le=10000, description="Number of recent candlestick records, default 100"),
     include_indicators: bool = Query(True, description="Include EMA9, EMA21, EMA50, RSI14, ATR14 overlays"),
 ):
     """
     Real-Time Candlestick Endpoint for Next.js Frontend:
-    Uses LiveGoldMarket WebSocket tick stream to update the currently forming candle in real time,
-    with base historical caching to avoid Twelve Data REST rate limits.
+    Uses MT5 terminal candles if connected so the chart price matches MT5 execution 100%.
+    Falls back to LiveGoldMarket WebSocket and Twelve Data.
     """
+    # 1. Try real-time candles from connected MT5 terminal first
+    try:
+        mt5_df = get_mt5_candles(symbol=symbol, interval=interval, limit=limit)
+        if mt5_df is not None and len(mt5_df) > 0:
+            if include_indicators:
+                candles_data = format_candles_for_frontend(mt5_df, limit=limit)
+            else:
+                recent = mt5_df.tail(limit).copy()
+                recent["datetime"] = recent["datetime"].astype(str)
+                candles_data = recent.to_dict(orient="records")
+
+            current_price = float(mt5_df.iloc[-1]["close"]) if len(mt5_df) > 0 else None
+            return {
+                "success": True,
+                "symbol": symbol,
+                "interval": interval,
+                "count": len(candles_data),
+                "current_price": current_price,
+                "connection_status": "connected",
+                "source": "MetaTrader 5",
+                "candles": candles_data,
+            }
+    except Exception:
+        pass
+
     try:
         # Prefer live real-time market with in-memory WebSocket ticks
         result = market.get_candles(interval=interval, limit=limit)
@@ -199,6 +262,7 @@ def get_candles_for_nextjs(
                 "count": len(candles_data),
                 "current_price": current_price,
                 "connection_status": market.connection_status,
+                "source": "Twelve Data",
                 "candles": candles_data,
             }
         except Exception as fb_exc:
@@ -494,22 +558,108 @@ def gold_analysis(
         )
 
 
+@app.get("/api/trades/active")
 @app.get("/trades/active")
 def get_active_position():
     """Retrieve the currently open trade position, entry details, and active SL/TP."""
     trade = load_active_trade()
-    if trade is None:
-        return {
-            "status": "FLAT",
-            "active": False,
-            "message": "No active position currently open",
-            "position": None,
+    latest = get_latest_analysis()
+    
+    # 1. If an active position is open in trade_manager
+    if trade and trade.get("status") == "OPEN":
+        direction = trade.get("direction", "BUY").upper()
+        entry_price = float(trade["entry_price"])
+        trade_sl = float(trade.get("stop_loss") or trade.get("sl"))
+        trade_tp = float(trade.get("take_profit") or trade.get("tp"))
+        actual_risk = max(abs(entry_price - trade_sl), 0.5)
+
+        tp1 = trade.get("tp1")
+        tp2 = trade.get("tp2") or trade_tp
+        tp3 = trade.get("tp3")
+
+        # Validate order consistency:
+        # BUY: entry < tp1 < tp2 < tp3
+        # SELL: entry > tp1 > tp2 > tp3
+        is_consistent = False
+        if tp1 is not None and tp2 is not None and tp3 is not None:
+            if direction == "BUY" and entry_price < tp1 < tp2 < tp3:
+                is_consistent = True
+            elif direction == "SELL" and entry_price > tp1 > tp2 > tp3:
+                is_consistent = True
+
+        if not is_consistent:
+            if direction == "BUY":
+                tp1 = round(entry_price + (actual_risk * 1.5), 3)
+                tp2 = round(trade_tp, 3) if trade_tp > tp1 else round(entry_price + (actual_risk * 2.0), 3)
+                tp3 = round(max(entry_price + (actual_risk * 3.0), tp2 + (actual_risk * 0.5)), 3)
+            else:
+                tp1 = round(entry_price - (actual_risk * 1.5), 3)
+                tp2 = round(trade_tp, 3) if trade_tp < tp1 else round(entry_price - (actual_risk * 2.0), 3)
+                tp3 = round(min(entry_price - (actual_risk * 3.0), tp2 - (actual_risk * 0.5)), 3)
+
+            trade["tp1"] = tp1
+            trade["tp2"] = tp2
+            trade["tp3"] = tp3
+         
+
+        setup = {
+            "direction": direction,
+            "entry_price": entry_price,
+            "stop_loss": trade_sl,
+            "take_profit": trade_tp,
+            "sl": trade_sl,
+            "tp": trade_tp,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "status": "OPEN",
+            "reason": trade.get("entry_reason", ""),
         }
+        trade_with_tps = dict(trade)
+        trade_with_tps["tp1"] = tp1
+        trade_with_tps["tp2"] = tp2
+        trade_with_tps["tp3"] = tp3
+
+        return {
+            "status": "ACTIVE_POSITION",
+            "active": True,
+            "message": f"Active {direction} position open from {entry_price}",
+            "position": trade_with_tps,
+            "setup": setup,
+        }
+
+    # 2. Check latest analysis: if trade was closed by SL/TP, ensure setup is completely hidden
+    if latest:
+        action = latest.get("action", "")
+        trade_status = latest.get("trade_status", "")
+        if action in ("CLOSE_SL", "CLOSE_TP") or trade_status in ("CLOSED_SL", "CLOSED_TP"):
+            return {
+                "status": "FLAT",
+                "active": False,
+                "message": latest.get("message", "Position closed on SL/TP"),
+                "position": None,
+                "setup": None,
+            }
+
+        # Only return setup if it's a confirmed new entry and not closed
+        latest_setup = latest.get("setup")
+        if latest_setup and latest.get("is_new_entry"):
+            status_str = latest_setup.get("status", "")
+            if status_str not in ("CLOSED_SL", "CLOSED_TP", "CLOSED", "FLAT"):
+                return {
+                    "status": "ACTIVE_SETUP",
+                    "active": True,
+                    "message": f"Confirmed {latest_setup.get('direction')} setup at {latest_setup.get('entry_price')}",
+                    "position": None,
+                    "setup": latest_setup,
+                }
+
     return {
-        "status": "ACTIVE_POSITION",
-        "active": True,
-        "message": f"Active {trade.get('direction')} position open from {trade.get('entry_price')}",
-        "position": trade,
+        "status": "FLAT",
+        "active": False,
+        "message": "No active position currently open",
+        "position": None,
+        "setup": None,
     }
 
 
@@ -523,6 +673,8 @@ class OrderRequest(BaseModel):
     action: str = Field(..., description="BUY or SELL")
     volume: float = Field(default=0.01, description="Lot size, e.g. 0.01")
     symbol: str = Field(default="XAUUSD", description="Symbol, e.g. XAUUSD")
+    price: Optional[float] = Field(default=None, description="Expected chart price")
+    max_slippage: Optional[float] = Field(default=2.0, description="Max allowed difference between chart and MT5 in USD")
     sl: Optional[float] = Field(default=None, description="Stop Loss price")
     tp: Optional[float] = Field(default=None, description="Take Profit price")
     comment: Optional[str] = Field(default="GoldPilot Web Order", description="Order comment")
@@ -536,6 +688,8 @@ def execute_trade_order(req: OrderRequest):
         action=req.action,
         volume=req.volume,
         symbol=req.symbol,
+        expected_price=req.price,
+        max_slippage=req.max_slippage or 2.0,
         sl=req.sl,
         tp=req.tp,
         comment=req.comment or "GoldPilot Web Order",
@@ -578,6 +732,7 @@ def close_trade_position(req: ClosePositionRequest):
             status_code=400,
             detail=result.get("error") or result.get("message", "Failed to close position"),
         )
+    reset_active_trade()
     return result
 
 

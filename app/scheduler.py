@@ -100,6 +100,9 @@ def scheduled_analysis():
         # Extract potential setup SL and TP
         potential_sl = risk_levels.get("sl") if risk_levels else None
         potential_tp = risk_levels.get("tp") if risk_levels else None
+        potential_tp1 = risk_levels.get("tp1") if risk_levels else None
+        potential_tp2 = risk_levels.get("tp2") if risk_levels else None
+        potential_tp3 = risk_levels.get("tp3") if risk_levels else None
 
         # Execute trade guard: Prevent duplicate entries and require confirmed SL/TP
         trade_exec = process_trade_signal(
@@ -109,31 +112,56 @@ def scheduled_analysis():
             tp=potential_tp,
             reason=reason,
             timeframe="5min",
+            tp1=potential_tp1,
+            tp2=potential_tp2,
+            tp3=potential_tp3,
         )
 
-        # Use effective SL and TP (from active position if holding, or from trade_exec)
-        effective_sl = trade_exec.get("sl", potential_sl)
-        effective_tp = trade_exec.get("tp", potential_tp)
+        # Handle trade closure (SL hit or TP hit)
+        trade_action = trade_exec.get("action", "")
+        trade_status = trade_exec.get("trade_status", "")
+        is_closed = trade_action in ("CLOSE_SL", "CLOSE_TP") or trade_status in ("CLOSED_SL", "CLOSED_TP")
 
-        # Build setup card
-        setup = None
-        if technical.get("setup") or risk_levels:
-            base_setup = technical.get("setup") or {}
-            setup = {
-                "status": "PENDING_NEWS_CLEARANCE" if news_blocked else trade_exec.get("trade_status", "ACTIVE"),
-                "direction": raw_signal,
-                "entry_price": trade_exec.get("entry_price", price),
-                "stop_loss": effective_sl,
-                "take_profit": effective_tp,
-                "sl": effective_sl,
-                "tp": effective_tp,
-                "tp1": risk_levels.get("tp1") if risk_levels else base_setup.get("tp1"),
-                "tp2": risk_levels.get("tp2") if risk_levels else base_setup.get("tp2"),
-                "tp3": risk_levels.get("tp3") if risk_levels else base_setup.get("tp3"),
-                "risk_reward_ratio": risk_levels.get("risk_reward_ratio", 2.0) if risk_levels else 2.0,
-                "confidence": base_setup.get("confidence", "MEDIUM"),
-                "reasons": base_setup.get("reasons", [reason]),
-            }
+        # Use effective SL and TP only if an active position exists or a new entry is confirmed
+        if is_closed and not trade_exec.get("is_new_entry"):
+            effective_sl = None
+            effective_tp = None
+            setup = None
+            has_setup = False
+        else:
+            effective_sl = trade_exec.get("sl", potential_sl)
+            effective_tp = trade_exec.get("tp", potential_tp)
+
+            # Build setup card only if there is an active position or confirmed new entry
+            setup = None
+            if (technical.get("setup") or risk_levels) and (trade_exec.get("is_new_entry") or trade_status == "ACTIVE_POSITION"):
+                base_setup = technical.get("setup") or {}
+                if trade_status == "ACTIVE_POSITION":
+                    effective_tp1 = trade_exec.get("tp1")
+                    effective_tp2 = trade_exec.get("tp2") or effective_tp
+                    effective_tp3 = trade_exec.get("tp3")
+                else:
+                    effective_tp1 = trade_exec.get("tp1") or (risk_levels.get("tp1") if risk_levels else base_setup.get("tp1"))
+                    effective_tp2 = trade_exec.get("tp2") or (risk_levels.get("tp2") if risk_levels else base_setup.get("tp2")) or effective_tp
+                    effective_tp3 = trade_exec.get("tp3") or (risk_levels.get("tp3") if risk_levels else base_setup.get("tp3"))
+
+                setup = {
+                    "status": "PENDING_NEWS_CLEARANCE" if news_blocked else trade_status or "ACTIVE",
+                    "direction": raw_signal,
+                    "entry_price": trade_exec.get("entry_price", price),
+                    "stop_loss": effective_sl,
+                    "take_profit": effective_tp,
+                    "sl": effective_sl,
+                    "tp": effective_tp,
+                    "tp1": effective_tp1,
+                    "tp2": effective_tp2,
+                    "tp3": effective_tp3,
+                    "risk_reward_ratio": risk_levels.get("risk_reward_ratio", 2.0) if risk_levels else 2.0,
+                    "confidence": base_setup.get("confidence", "MEDIUM"),
+                    "reasons": base_setup.get("reasons", [reason]),
+                }
+            else:
+                has_setup = False
 
         result = {
             "timestamp_utc": started_at,
@@ -148,7 +176,7 @@ def scheduled_analysis():
             "message": trade_exec.get("message"),
             "reason": reason,
             "price": price,
-            "has_setup": has_setup,
+            "has_setup": bool(setup),
             "take_profit": effective_tp,
             "stop_loss": effective_sl,
             "tp": effective_tp,

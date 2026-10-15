@@ -1,0 +1,16 @@
+{
+  "id": "trade_20261015_084141",
+  "direction": "BUY",
+  "entry_price": 4153.607,
+  "stop_loss": 4138.277,
+  "take_profit": 4184.267,
+  "sl": 4138.277,
+  "tp": 4184.267,
+  "tp1": 4176.602,
+  "tp2": 4184.267,
+  "tp3": 4199.598,
+  "timeframe": "5min",
+  "entry_time": "2026-10-15T08:41:41.069338+00:00",
+  "status": "OPEN",
+  "entry_reason": "Strong bullish confluence: HTF (1h) trend is BULLISH; Entry (5min) EMA9 (4152.76) > EMA21 (4148.6); RSI (63.43) confirms upward momentum"
+}

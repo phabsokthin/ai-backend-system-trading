@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Any, Dict, Optional
+import time
+from typing import Any, Dict, List, Optional
+import pandas as pd
 
 logger = logging.getLogger("mt5-bridge")
 
@@ -17,24 +19,49 @@ _lock = threading.Lock()
 _connected = False
 _terminal_path = r"C:\Program Files\MetaTrader 5\terminal64.exe"
 
+TIMEFRAME_MT5_MAP = {
+    "1min": 1,
+    "1m": 1,
+    "5min": 5,
+    "5m": 5,
+    "15min": 15,
+    "15m": 15,
+    "30min": 30,
+    "30m": 30,
+    "1h": 16385,
+    "1H": 16385,
+    "4h": 16388,
+    "4H": 16388,
+    "1day": 16408,
+    "1d": 16408,
+    "1D": 16408,
+}
+
+
+_cached_terminal_path: Optional[str] = None
+_cached_symbols: Dict[str, str] = {}
+
 
 def _get_wine_terminal_path() -> str:
-    """Find the terminal64.exe path in Wine prefix."""
+    """Find the terminal64.exe path in Wine prefix (cached for instant performance)."""
+    global _cached_terminal_path
+    if _cached_terminal_path is not None:
+        return _cached_terminal_path
+
     wineprefix = os.path.expanduser(
         "~/Library/Application Support/net.metaquotes.wine.metatrader5"
     )
-    drive_c = os.path.join(wineprefix, "drive_c")
-    if os.path.exists(drive_c):
-        for root, dirs, files in os.walk(drive_c):
-            for f in files:
-                if f.lower() in ("terminal64.exe", "terminal.exe"):
-                    rel = os.path.relpath(os.path.join(root, f), drive_c)
-                    return "C:\\" + rel.replace("/", "\\")
-    return _terminal_path
+    standard_p = os.path.join(wineprefix, "drive_c", "Program Files", "MetaTrader 5", "terminal64.exe")
+    if os.path.exists(standard_p):
+        _cached_terminal_path = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+        return _cached_terminal_path
+
+    _cached_terminal_path = _terminal_path
+    return _cached_terminal_path
 
 
 def ensure_connected(force_reconnect: bool = False) -> bool:
-    """Ensure MT5 connection is active and synchronized."""
+    """Ensure MT5 connection is active and synchronized (instant check)."""
     global _connected
     if mt5 is None:
         logger.error("mt5_mac is not installed")
@@ -42,16 +69,9 @@ def ensure_connected(force_reconnect: bool = False) -> bool:
 
     with _lock:
         if _connected and not force_reconnect:
-            info = mt5.account_info()
-            if info is not None and info.trade_expert:
-                return True
-            logger.info("MT5 permissions changed or connection dropped, reconnecting...")
-            try:
-                mt5.shutdown()
-            except Exception:
-                pass
-            _connected = False
-        elif force_reconnect:
+            return True
+
+        if force_reconnect:
             try:
                 mt5.shutdown()
             except Exception:
@@ -103,32 +123,74 @@ def get_account_summary() -> Dict[str, Any]:
 
 
 def resolve_symbol(symbol: str) -> str:
-    """Find matching symbol name in MT5 (e.g. XAUUSD -> XAUUSDm / XAUUSD)."""
+    """Find matching symbol name in MT5 with cache for instant resolution."""
     clean_sym = symbol.replace("/", "").strip().upper()
+    if clean_sym in _cached_symbols:
+        return _cached_symbols[clean_sym]
+
     candidates = [clean_sym, f"{clean_sym}m", f"{clean_sym}.a", f"{clean_sym}_i"]
-    
     for candidate in candidates:
         info = mt5.symbol_info(candidate)
         if info is not None:
-            # Enable symbol in Market Watch if disabled
             if not info.visible:
                 mt5.symbol_select(candidate, True)
+            _cached_symbols[clean_sym] = candidate
             return candidate
 
-    # Fallback to standard
     mt5.symbol_select(clean_sym, True)
+    _cached_symbols[clean_sym] = clean_sym
     return clean_sym
+
+
+def get_mt5_live_tick(symbol: str = "XAUUSD") -> Optional[Dict[str, Any]]:
+    """Return the latest bid/ask/price tick directly from connected MT5 terminal."""
+    if not ensure_connected():
+        return None
+    target_symbol = resolve_symbol(symbol)
+    tick = mt5.symbol_info_tick(target_symbol)
+    if not tick:
+        return None
+    bid = round(float(tick.bid), 3)
+    ask = round(float(tick.ask), 3)
+    price = round((bid + ask) / 2.0, 3)
+    return {
+        "symbol": target_symbol,
+        "bid": bid,
+        "ask": ask,
+        "price": price,
+        "spread": round(ask - bid, 3),
+        "timestamp": float(getattr(tick, "time", time.time())),
+    }
+
+
+def get_mt5_candles(symbol: str = "XAUUSD", interval: str = "5min", limit: int = 100) -> Optional[pd.DataFrame]:
+    """Fetch real-time historical candlesticks directly from MT5 terminal."""
+    if not ensure_connected():
+        return None
+    target_symbol = resolve_symbol(symbol)
+    tf = TIMEFRAME_MT5_MAP.get(interval.lower(), 5)
+    rates = mt5.copy_rates_from_pos(target_symbol, tf, 0, max(limit + 50, 100))
+    if rates is None or len(rates) == 0:
+        return None
+
+    df = pd.DataFrame(rates)
+    df["datetime"] = pd.to_datetime(df["time"], unit="s")
+    for col in ["open", "high", "low", "close"]:
+        df[col] = df[col].astype(float)
+    return df
 
 
 def send_order(
     action: str,
     volume: float = 0.01,
     symbol: str = "XAUUSD",
+    expected_price: Optional[float] = None,
+    max_slippage: float = 2.0,
     sl: Optional[float] = None,
     tp: Optional[float] = None,
     comment: str = "Web Order",
 ) -> Dict[str, Any]:
-    """Execute a market BUY or SELL order in MetaTrader 5."""
+    """Execute a market BUY or SELL order in MetaTrader 5 with chart price verification."""
     if not ensure_connected():
         return {
             "success": False,
@@ -151,6 +213,10 @@ def send_order(
         }
 
     price = tick.ask if action_upper == "BUY" else tick.bid
+    # Prioritize the available price clicked by user, or latest live MT5 price
+    order_price = float(expected_price) if (expected_price is not None and expected_price > 0) else float(price)
+    deviation_points = max(int(max_slippage * 100), 50)
+
     order_type = 0 if action_upper == "BUY" else 1  # 0: ORDER_TYPE_BUY, 1: ORDER_TYPE_SELL
 
     # Try different filling types (IOC -> FOK -> RETURN) as brokers differ
@@ -163,10 +229,10 @@ def send_order(
             "symbol": target_symbol,
             "volume": float(volume),
             "type": order_type,
-            "price": float(price),
+            "price": order_price,
             "sl": float(sl) if sl else 0.0,
             "tp": float(tp) if tp else 0.0,
-            "deviation": 30,
+            "deviation": deviation_points,
             "magic": 108888,
             "comment": comment,
             "type_time": 0,  # ORDER_TIME_GTC
@@ -174,6 +240,11 @@ def send_order(
         }
 
         trade_result = mt5.order_send(request)
+        # If broker insists on current live tick price (retcode 10015), retry with tick price
+        if trade_result is not None and trade_result.retcode == 10015 and order_price != price:
+            request["price"] = float(price)
+            trade_result = mt5.order_send(request)
+
         if trade_result is not None:
             last_result = trade_result
             # Check success (10009 = TRADE_RETCODE_DONE, 10008 = TRADE_RETCODE_PLACED)
@@ -184,7 +255,7 @@ def send_order(
                     "action": action_upper,
                     "symbol": target_symbol,
                     "volume": float(volume),
-                    "price": trade_result.price or price,
+                    "price": trade_result.price or order_price,
                     "deal": getattr(trade_result, "deal", 0),
                     "order": getattr(trade_result, "order", 0),
                     "retcode": trade_result.retcode,

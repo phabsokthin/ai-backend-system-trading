@@ -47,10 +47,12 @@ def calculate_risk_levels(
         else:
             stop_loss = price - distance
 
-        actual_risk = price - stop_loss
+        actual_risk = max(price - stop_loss, 0.5)
+        # Ensure 1.5R, 2.0R, 3.0R progression: TP1 < TP2 < TP3
         tp1 = price + (actual_risk * 1.5)
-        tp2 = price + (actual_risk * risk_reward)
-        tp3 = max(nearest_res, price + (actual_risk * 3.0)) if nearest_res else price + (actual_risk * 3.0)
+        tp2 = max(tp1 + (actual_risk * 0.5), price + (actual_risk * risk_reward))
+        tp3_target = max(nearest_res, price + (actual_risk * 3.0)) if nearest_res else (price + (actual_risk * 3.0))
+        tp3 = max(tp2 + (actual_risk * 0.5), tp3_target)
         take_profit = tp2
 
     elif signal == "SELL":
@@ -60,10 +62,12 @@ def calculate_risk_levels(
         else:
             stop_loss = price + distance
 
-        actual_risk = stop_loss - price
+        actual_risk = max(stop_loss - price, 0.5)
+        # Ensure 1.5R, 2.0R, 3.0R progression: TP1 > TP2 > TP3
         tp1 = price - (actual_risk * 1.5)
-        tp2 = price - (actual_risk * risk_reward)
-        tp3 = min(nearest_sup, price - (actual_risk * 3.0)) if nearest_sup else price - (actual_risk * 3.0)
+        tp2 = min(tp1 - (actual_risk * 0.5), price - (actual_risk * risk_reward))
+        tp3_target = min(nearest_sup, price - (actual_risk * 3.0)) if nearest_sup else (price - (actual_risk * 3.0))
+        tp3 = min(tp2 - (actual_risk * 0.5), tp3_target)
         take_profit = tp2
 
     else:
