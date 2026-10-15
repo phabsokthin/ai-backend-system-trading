@@ -1,0 +1,34 @@
+{
+  "verified": true,
+  "updated_at": "2026-10-15T06:24:09.857008+00:00",
+  "source": "http://127.0.0.1:3000/api/v1/high-impact",
+  "source_date": "2026-10-15",
+  "source_timestamp": "2026-10-15T06:23:59.778Z",
+  "timezone_used": "Asia/Phnom_Penh",
+  "events": [
+    {
+      "name": "Core PPI m/m",
+      "currency": "USD",
+      "time": "2026-10-15T03:00:00+00:00",
+      "impact": "high"
+    },
+    {
+      "name": "Core Retail Sales m/m",
+      "currency": "USD",
+      "time": "2026-10-15T03:00:00+00:00",
+      "impact": "high"
+    },
+    {
+      "name": "PPI m/m",
+      "currency": "USD",
+      "time": "2026-10-15T03:00:00+00:00",
+      "impact": "high"
+    },
+    {
+      "name": "Retail Sales m/m",
+      "currency": "USD",
+      "time": "2026-10-15T03:00:00+00:00",
+      "impact": "high"
+    }
+  ]
+}
