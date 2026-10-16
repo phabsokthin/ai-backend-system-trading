@@ -26,6 +26,7 @@ from app.trade_manager import (
     process_trade_signal,
     load_active_trade,
     reset_active_trade,
+    sync_active_position,
 )
 
 from app.live_market import market
@@ -205,7 +206,7 @@ async def websocket_live_market(websocket: WebSocket):
 def get_candles_for_nextjs(
     symbol: str = Query("XAU/USD", description="Symbol name, default XAU/USD"),
     interval: str = Query("5min", description="Timeframe interval: 5min, 15min, 1h, 4h, 1day"),
-    limit: int = Query(100, ge=1, le=10000, description="Number of recent candlestick records, default 100"),
+    limit: int = Query(100, ge=1, le=5000, description="Number of recent candlestick records, default 100"),
     include_indicators: bool = Query(True, description="Include EMA9, EMA21, EMA50, RSI14, ATR14 overlays"),
 ):
     """
@@ -317,6 +318,7 @@ def get_chart_data_for_nextjs(
             tp=risk_calc.get("tp") if risk_calc else None,
             reason=analysis.get("reason", ""),
             timeframe=interval,
+            candles_df=entry_candles,
         )
 
         try:
@@ -481,6 +483,7 @@ def gold_analysis(
             tp=potential_tp,
             reason=final_reason,
             timeframe=entry_timeframe,
+            candles_df=entry_candles,
         )
 
         effective_sl = trade_exec.get("sl", potential_sl)
@@ -516,7 +519,8 @@ def gold_analysis(
         # 7. Optional AI commentary
         ai = get_ai_commentary(analysis, news_analysis)
 
-        return {
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "symbol": "XAU/USD",
             "price": price,
             "action": trade_exec.get("action"),
@@ -551,6 +555,15 @@ def gold_analysis(
             "real_orders_enabled": False,
         }
 
+        # Store analysis result in MongoDB
+        try:
+            from app.mongo_db import save_analysis
+            save_analysis(payload)
+        except Exception:
+            pass
+
+        return payload
+
     except Exception as exc:
         raise HTTPException(
             status_code=502,
@@ -562,15 +575,31 @@ def gold_analysis(
 @app.get("/trades/active")
 def get_active_position():
     """Retrieve the currently open trade position, entry details, and active SL/TP."""
-    trade = load_active_trade()
+    # 1. Audit active position with current market price & historical candles
+    sync_result = sync_active_position()
+    trade = sync_result.get("position")
     latest = get_latest_analysis()
     
-    # 1. If an active position is open in trade_manager
-    if trade and trade.get("status") == "OPEN":
+    # If active trade is confirmed open and not hit SL/TP
+    if sync_result.get("active") and trade and trade.get("status") == "OPEN":
         direction = trade.get("direction", "BUY").upper()
         entry_price = float(trade["entry_price"])
-        trade_sl = float(trade.get("stop_loss") or trade.get("sl"))
-        trade_tp = float(trade.get("take_profit") or trade.get("tp"))
+        raw_sl = trade.get("stop_loss") or trade.get("sl")
+        raw_tp = trade.get("take_profit") or trade.get("tp")
+
+        # Setup cannot hold if SL or TP is hidden
+        if raw_sl is None or raw_tp is None:
+            reset_active_trade()
+            return {
+                "status": "FLAT",
+                "active": False,
+                "message": "Closed position: Stop Loss or Take Profit was missing/hidden.",
+                "position": None,
+                "setup": None,
+            }
+
+        trade_sl = float(raw_sl)
+        trade_tp = float(raw_tp)
         actual_risk = max(abs(entry_price - trade_sl), 0.5)
 
         tp1 = trade.get("tp1")
@@ -600,7 +629,6 @@ def get_active_position():
             trade["tp1"] = tp1
             trade["tp2"] = tp2
             trade["tp3"] = tp3
-         
 
         setup = {
             "direction": direction,
@@ -628,7 +656,20 @@ def get_active_position():
             "setup": setup,
         }
 
-    # 2. Check latest analysis: if trade was closed by SL/TP, ensure setup is completely hidden
+    # 2. Check sync result or latest analysis: if trade was closed by SL/TP, ensure setup is completely hidden
+    if not sync_result.get("active") and sync_result.get("exec_result"):
+        exec_res = sync_result["exec_result"]
+        action = exec_res.get("action", "")
+        trade_status = exec_res.get("trade_status", "")
+        if action in ("CLOSE_SL", "CLOSE_TP") or trade_status in ("CLOSED_SL", "CLOSED_TP"):
+            return {
+                "status": "FLAT",
+                "active": False,
+                "message": exec_res.get("message", "Position closed on SL/TP"),
+                "position": None,
+                "setup": None,
+            }
+
     if latest:
         action = latest.get("action", "")
         trade_status = latest.get("trade_status", "")
@@ -657,16 +698,18 @@ def get_active_position():
     return {
         "status": "FLAT",
         "active": False,
-        "message": "No active position currently open",
+        "message": "No active position currently open. Waiting for new setup.",
         "position": None,
         "setup": None,
     }
 
 
+@app.post("/api/trades/reset")
 @app.post("/trades/reset")
 def reset_position():
     """Emergency reset to close/clear the active position state."""
     return reset_active_trade()
+
 
 
 class OrderRequest(BaseModel):
@@ -825,3 +868,33 @@ def latest_scheduled_analysis():
     if data is None:
         raise HTTPException(status_code=404, detail="No scheduled analysis recorded yet")
     return data
+
+
+@app.get("/api/analysis/history")
+def get_mongodb_analysis_history(limit: int = Query(50, ge=1, le=500)):
+    """Retrieve historical analysis records saved in MongoDB 'analysis' collection."""
+    from app.mongo_db import get_analysis_history
+    records = get_analysis_history(limit=limit)
+    return {
+        "success": True,
+        "count": len(records),
+        "history": records,
+    }
+
+
+@app.get("/api/mongodb/status")
+def get_mongodb_status():
+    """Check MongoDB connection and collection document counts."""
+    from app.mongo_db import check_mongodb, db
+    status = check_mongodb()
+    if status.get("connected") and db is not None:
+        try:
+            status["collections"] = {
+                "analysis": db["analysis"].count_documents({}),
+                "signals": db["signals"].count_documents({}),
+                "trades": db["trades"].count_documents({}),
+                "candles": db["candles"].count_documents({}),
+            }
+        except Exception as e:
+            status["collections_error"] = str(e)
+    return status

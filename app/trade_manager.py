@@ -41,12 +41,18 @@ def save_active_trade(trade: Optional[Dict[str, Any]]) -> None:
 
 
 def archive_closed_trade(trade: Dict[str, Any]) -> None:
-    """Record completed trade to trade_history.jsonl."""
+    """Record completed trade to trade_history.jsonl and MongoDB."""
     try:
         with TRADE_HISTORY_FILE.open("a", encoding="utf-8") as file:
             file.write(json.dumps(trade, default=str) + "\n")
     except Exception as exc:
         logger.error("Failed archiving trade: %s", exc)
+
+    try:
+        from app.mongo_db import save_trade_to_db
+        save_trade_to_db(trade)
+    except Exception as db_exc:
+        logger.debug("Failed archiving trade to MongoDB: %s", db_exc)
 
 
 def validate_sl_tp(direction: str, entry_price: float, sl: Optional[float], tp: Optional[float]) -> tuple[bool, str]:
@@ -92,91 +98,210 @@ def process_trade_signal(
     tp1: Optional[float] = None,
     tp2: Optional[float] = None,
     tp3: Optional[float] = None,
+    candles_df: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Main trade execution guard:
     1. Prevents duplicate entries on consecutive cycles.
-    2. Blocks entries if SL or TP are missing / invalid.
-    3. Manages active trade lifecycle (HOLD, CLOSE on TP, CLOSE on SL).
-    4. Formats clean JSON status messages.
+    2. Blocks entries and active holding if SL or TP are missing / hidden / invalid.
+    3. Checks current price AND candlestick history since entry_time for SL or TP hits.
+    4. Automatically closes trade on SL/TP hit, archives it, and returns system to FLAT/WAIT.
+    5. Formats clean JSON status messages.
     """
     now_utc = datetime.now(timezone.utc).isoformat()
     active_trade = load_active_trade()
 
     # Case 1: An active trade is currently open
     if active_trade is not None and active_trade.get("status") == "OPEN":
-        direction = active_trade["direction"]
+        direction = active_trade.get("direction", "BUY").upper()
         entry_price = float(active_trade["entry_price"])
-        trade_sl = float(active_trade["stop_loss"])
-        trade_tp = float(active_trade["take_profit"])
+        raw_sl = active_trade.get("stop_loss") if active_trade.get("stop_loss") is not None else active_trade.get("sl")
+        raw_tp = active_trade.get("take_profit") if active_trade.get("take_profit") is not None else active_trade.get("tp")
 
-        # Calculate current unrealized PnL in points
+        # RULE: Setup cannot hold if Stop Loss or Take Profit is hidden, missing, or invalid (<= 0)
+        if raw_sl is None or raw_tp is None:
+            logger.warning("Active trade %s has hidden/missing SL or TP. Closing immediately.", active_trade.get("id"))
+            active_trade["status"] = "CLOSED_INVALID"
+            active_trade["exit_price"] = current_price
+            active_trade["exit_time"] = now_utc
+            active_trade["exit_reason"] = "Stop Loss or Take Profit was hidden or empty."
+            archive_closed_trade(active_trade)
+            save_active_trade(None)
+            return {
+                "action": "CLOSE_INVALID",
+                "is_new_entry": False,
+                "duplicate_prevented": False,
+                "signal": "WAIT",
+                "trade_status": "FLAT",
+                "entry_price": entry_price,
+                "exit_price": current_price,
+                "stop_loss": None,
+                "take_profit": None,
+                "sl": None,
+                "tp": None,
+                "pnl_points": 0.0,
+                "active_position": None,
+                "message": "⚠️ Active setup cannot hold without confirmed SL and TP. Position closed, waiting for new setup.",
+            }
+
+        trade_sl = float(raw_sl)
+        trade_tp = float(raw_tp)
+
+        # Evaluate if SL or TP was reached (by current live price OR by candlestick history since entry)
+        hit_tp = False
+        hit_sl = False
+        exit_price = current_price
+        exit_time = now_utc
+        exit_reason = ""
+
+        # 1. Instant check against current live price
         if direction == "BUY":
-            pnl_points = round(current_price - entry_price, 3)
-            hit_tp = current_price >= trade_tp
-            hit_sl = current_price <= trade_sl
+            if current_price <= trade_sl:
+                hit_sl = True
+                exit_price = trade_sl
+                exit_reason = f"Stop Loss hit at {current_price:.3f} (SL: {trade_sl:.3f})"
+            elif current_price >= trade_tp:
+                hit_tp = True
+                exit_price = trade_tp
+                exit_reason = f"Take Profit reached at {current_price:.3f} (TP: {trade_tp:.3f})"
         else:  # SELL
-            pnl_points = round(entry_price - current_price, 3)
-            hit_tp = current_price <= trade_tp
-            hit_sl = current_price >= trade_sl
+            if current_price >= trade_sl:
+                hit_sl = True
+                exit_price = trade_sl
+                exit_reason = f"Stop Loss hit at {current_price:.3f} (SL: {trade_sl:.3f})"
+            elif current_price <= trade_tp:
+                hit_tp = True
+                exit_price = trade_tp
+                exit_reason = f"Take Profit reached at {current_price:.3f} (TP: {trade_tp:.3f})"
+
+        # 2. Historical candlestick check since entry_time
+        # In real trading, if any candle wick crossed SL or TP between cycles or during downtime, the trade was executed!
+        if not hit_sl and not hit_tp:
+            entry_time_str = active_trade.get("entry_time")
+            eval_df = candles_df
+
+            # If candles_df was not passed, dynamically fetch recent market candles to audit the position
+            if eval_df is None and entry_time_str:
+                try:
+                    import pandas as pd
+                    from app.market_data import get_gold_candles
+                    entry_dt = pd.to_datetime(entry_time_str, utc=True)
+                    hours_elapsed = (datetime.now(timezone.utc) - entry_dt.to_pydatetime()).total_seconds() / 3600.0
+                    if hours_elapsed > 4:
+                        eval_df = get_gold_candles(interval="15min", outputsize=min(max(int(hours_elapsed * 4) + 30, 60), 300))
+                    else:
+                        eval_df = get_gold_candles(interval=timeframe or "5min", outputsize=100)
+                except Exception as exc:
+                    logger.debug("Candle audit fetch skipped: %s", exc)
+
+            if eval_df is not None:
+                try:
+                    import pandas as pd
+                    entry_dt = pd.to_datetime(entry_time_str, utc=True)
+                    df_copy = eval_df.copy()
+                    if "datetime" in df_copy.columns:
+                        df_copy["_parsed_dt"] = pd.to_datetime(df_copy["datetime"], utc=True)
+                        df_sorted = df_copy.sort_values("_parsed_dt")
+                        for _, row in df_sorted.iterrows():
+                            if row["_parsed_dt"] >= entry_dt:
+                                c_low = float(row["low"])
+                                c_high = float(row["high"])
+                                c_time = str(row["datetime"])
+
+                                if direction == "BUY":
+                                    if c_low <= trade_sl:
+                                        hit_sl = True
+                                        exit_price = trade_sl
+                                        exit_time = c_time
+                                        exit_reason = f"Stop Loss hit at {trade_sl:.3f} on candle {c_time} (Low was {c_low:.3f})"
+                                        break
+                                    elif c_high >= trade_tp:
+                                        hit_tp = True
+                                        exit_price = trade_tp
+                                        exit_time = c_time
+                                        exit_reason = f"Take Profit reached at {trade_tp:.3f} on candle {c_time} (High was {c_high:.3f})"
+                                        break
+                                else:  # SELL
+                                    if c_high >= trade_sl:
+                                        hit_sl = True
+                                        exit_price = trade_sl
+                                        exit_time = c_time
+                                        exit_reason = f"Stop Loss hit at {trade_sl:.3f} on candle {c_time} (High was {c_high:.3f})"
+                                        break
+                                    elif c_low <= trade_tp:
+                                        hit_tp = True
+                                        exit_price = trade_tp
+                                        exit_time = c_time
+                                        exit_reason = f"Take Profit reached at {trade_tp:.3f} on candle {c_time} (Low was {c_low:.3f})"
+                                        break
+                except Exception as eval_err:
+                    logger.warning("Error checking candlestick history for SL/TP: %s", eval_err)
 
         # Check if Take Profit was reached
         if hit_tp:
+            pnl_points = round(exit_price - entry_price, 3) if direction == "BUY" else round(entry_price - exit_price, 3)
             active_trade["status"] = "CLOSED_TP"
-            active_trade["exit_price"] = current_price
-            active_trade["exit_time"] = now_utc
+            active_trade["exit_price"] = exit_price
+            active_trade["exit_time"] = exit_time
             active_trade["final_pnl_points"] = pnl_points
-            active_trade["exit_reason"] = f"Take Profit reached at {current_price:.3f}"
+            active_trade["exit_reason"] = exit_reason or f"Take Profit reached at {exit_price:.3f}"
 
             archive_closed_trade(active_trade)
             save_active_trade(None)
+
+            logger.info("Closed %s on TP: %s", direction, active_trade["exit_reason"])
 
             return {
                 "action": "CLOSE_TP",
                 "is_new_entry": False,
                 "duplicate_prevented": False,
-                "signal": signal,
+                "signal": "WAIT",
                 "trade_status": "CLOSED_TP",
                 "entry_price": entry_price,
-                "exit_price": current_price,
+                "exit_price": exit_price,
                 "stop_loss": trade_sl,
                 "take_profit": trade_tp,
                 "sl": trade_sl,
                 "tp": trade_tp,
                 "pnl_points": pnl_points,
                 "active_position": None,
-                "message": f"✅ TAKE PROFIT REACHED: {direction} closed at {current_price:.3f} (+{pnl_points:.2f} pts profit).",
+                "message": f"✅ TAKE PROFIT REACHED: {direction} closed at {exit_price:.3f} (+{pnl_points:.2f} pts profit). Waiting for new setup.",
             }
 
         # Check if Stop Loss was hit
         if hit_sl:
+            pnl_points = round(exit_price - entry_price, 3) if direction == "BUY" else round(entry_price - exit_price, 3)
             active_trade["status"] = "CLOSED_SL"
-            active_trade["exit_price"] = current_price
-            active_trade["exit_time"] = now_utc
+            active_trade["exit_price"] = exit_price
+            active_trade["exit_time"] = exit_time
             active_trade["final_pnl_points"] = pnl_points
-            active_trade["exit_reason"] = f"Stop Loss hit at {current_price:.3f}"
+            active_trade["exit_reason"] = exit_reason or f"Stop Loss hit at {exit_price:.3f}"
 
             archive_closed_trade(active_trade)
             save_active_trade(None)
+
+            logger.info("Closed %s on SL: %s", direction, active_trade["exit_reason"])
 
             return {
                 "action": "CLOSE_SL",
                 "is_new_entry": False,
                 "duplicate_prevented": False,
-                "signal": signal,
+                "signal": "WAIT",
                 "trade_status": "CLOSED_SL",
                 "entry_price": entry_price,
-                "exit_price": current_price,
+                "exit_price": exit_price,
                 "stop_loss": trade_sl,
                 "take_profit": trade_tp,
                 "sl": trade_sl,
                 "tp": trade_tp,
                 "pnl_points": pnl_points,
                 "active_position": None,
-                "message": f"🛑 STOP LOSS HIT: {direction} stopped out at {current_price:.3f} ({pnl_points:.2f} pts loss).",
+                "message": f"🛑 STOP LOSS HIT: {direction} stopped out at {exit_price:.3f} ({pnl_points:.2f} pts loss). Waiting for new setup.",
             }
 
         # Trade is still active!
+        pnl_points = round(current_price - entry_price, 3) if direction == "BUY" else round(entry_price - current_price, 3)
+
         # Check if the incoming signal is the same (re-confirmation)
         if signal == direction:
             # Re-confirmation: prevent duplicate entry
@@ -340,7 +465,56 @@ def process_trade_signal(
     }
 
 
+def sync_active_position(
+    current_price: Optional[float] = None,
+    candles_df: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Audit and synchronize active trade state against latest market data.
+    If the active trade hit SL or TP, it is automatically closed and archived.
+    Returns the updated trade or None if flat/closed.
+    """
+    active_trade = load_active_trade()
+    if active_trade is None or active_trade.get("status") != "OPEN":
+        return {"active": False, "trade_status": "FLAT", "position": None}
+
+    # If current_price is not provided, fetch current candle close
+    if current_price is None or current_price <= 0:
+        try:
+            from app.market_data import get_gold_candles
+            recent = get_gold_candles(interval="5min", outputsize=5)
+            if recent is not None and len(recent) > 0:
+                current_price = float(recent.iloc[-1]["close"])
+        except Exception:
+            current_price = float(active_trade.get("entry_price", 0))
+
+    exec_result = process_trade_signal(
+        current_price=current_price,
+        signal="WAIT",
+        sl=active_trade.get("stop_loss"),
+        tp=active_trade.get("take_profit"),
+        reason="Position synchronization audit",
+        timeframe=active_trade.get("timeframe", "5min"),
+        candles_df=candles_df,
+    )
+
+    is_still_open = exec_result.get("trade_status") == "ACTIVE_POSITION"
+    return {
+        "active": is_still_open,
+        "trade_status": exec_result.get("trade_status", "FLAT"),
+        "position": exec_result.get("active_position"),
+        "exec_result": exec_result,
+    }
+
+
 def reset_active_trade() -> Dict[str, Any]:
     """Manual emergency reset of active position."""
+    trade = load_active_trade()
+    if trade:
+        trade["status"] = "MANUALLY_CLOSED"
+        trade["exit_time"] = datetime.now(timezone.utc).isoformat()
+        trade["exit_reason"] = "Manual reset requested by user"
+        archive_closed_trade(trade)
     save_active_trade(None)
     return {"status": "ok", "message": "Active position reset to flat"}
+

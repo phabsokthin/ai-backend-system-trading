@@ -115,6 +115,7 @@ def scheduled_analysis():
             tp1=potential_tp1,
             tp2=potential_tp2,
             tp3=potential_tp3,
+            candles_df=entry_candles,
         )
 
         # Handle trade closure (SL hit or TP hit)
@@ -199,6 +200,13 @@ def scheduled_analysis():
 
         with LOG_FILE.open("a", encoding="utf-8") as file:
             file.write(json.dumps(result, default=str) + "\n")
+
+        # Store analysis result in MongoDB
+        try:
+            from app.mongo_db import save_analysis
+            save_analysis(result)
+        except Exception as mongo_err:
+            logger.debug("MongoDB analysis storage skipped: %s", mongo_err)
 
         logger.info(
             "Analysis complete: action=%s signal=%s is_new_entry=%s price=%s TP=%s SL=%s duplicate_prevented=%s msg=%s",
