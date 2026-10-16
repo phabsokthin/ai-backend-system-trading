@@ -59,45 +59,58 @@ def check_mongodb() -> Dict[str, Any]:
 
 def save_analysis(analysis_data: Dict[str, Any]) -> Optional[str]:
     """
-    Store analysis result in MongoDB 'analysis' collection.
-    Also stores in 'signals' collection if a BUY or SELL setup exists.
-    Non-blocking / safe: will never crash caller if MongoDB is temporarily unavailable.
+    Store analysis result in MongoDB 'analysis' collection without duplicates.
+    When a brand-new entry is confirmed (is_new_entry == True), stores the setup
+    in 'signals' collection exactly once.
     """
     if analysis_collection is None:
         return None
 
     try:
-        # Clone to prevent MongoDB driver from mutating the original in-memory dict with ObjectId
         doc = dict(analysis_data)
+        timestamp_utc = doc.get("timestamp_utc")
+
+        # Deduplicate analysis records: if an analysis with this exact timestamp exists, return its ID
+        if timestamp_utc:
+            existing = analysis_collection.find_one({"timestamp_utc": timestamp_utc})
+            if existing:
+                return str(existing["_id"])
+
         if "created_at" not in doc:
             doc["created_at"] = datetime.now(timezone.utc)
 
         result = analysis_collection.insert_one(doc)
         inserted_id = str(result.inserted_id)
 
-        # If analysis contains a confirmed signal / setup, save to signals collection as well
-        signal = doc.get("signal")
-        if signal in ("BUY", "SELL") or doc.get("has_setup") or doc.get("is_new_entry"):
-            try:
-                sig_doc = {
-                    "analysis_id": inserted_id,
-                    "timestamp_utc": doc.get("timestamp_utc") or datetime.now(timezone.utc).isoformat(),
-                    "symbol": doc.get("symbol", "XAU/USD"),
-                    "signal": signal,
-                    "action": doc.get("action"),
-                    "price": doc.get("price"),
-                    "stop_loss": doc.get("stop_loss") or doc.get("sl"),
-                    "take_profit": doc.get("take_profit") or doc.get("tp"),
-                    "reason": doc.get("reason"),
-                    "setup": doc.get("setup"),
-                    "is_new_entry": doc.get("is_new_entry", False),
-                    "created_at": datetime.now(timezone.utc),
-                }
-                signals_collection.insert_one(sig_doc)
-            except Exception as sig_err:
-                logger.debug("Failed to record to signals_collection: %s", sig_err)
+        # STRICT: Only save to 'signals' collection on genuine NEW ENTRY (save only once per setup)
+        is_new_entry = doc.get("is_new_entry", False) or doc.get("action") in ("OPEN_BUY", "OPEN_SELL")
+        if is_new_entry and signals_collection is not None:
+            active_pos = doc.get("active_position") or doc.get("setup") or {}
+            setup_id = active_pos.get("id") or f"setup_{timestamp_utc}_{doc.get('signal')}"
 
-        logger.info("Saved analysis to MongoDB (id=%s, signal=%s)", inserted_id, doc.get("signal"))
+            sig_doc = {
+                "setup_id": setup_id,
+                "analysis_id": inserted_id,
+                "timestamp_utc": timestamp_utc or datetime.now(timezone.utc).isoformat(),
+                "symbol": doc.get("symbol", "XAU/USD"),
+                "signal": doc.get("signal"),
+                "action": doc.get("action"),
+                "price": doc.get("price"),
+                "stop_loss": doc.get("stop_loss") or doc.get("sl"),
+                "take_profit": doc.get("take_profit") or doc.get("tp"),
+                "reason": doc.get("reason"),
+                "setup": doc.get("setup"),
+                "is_new_entry": True,
+                "created_at": datetime.now(timezone.utc),
+            }
+            # Upsert by setup_id: strictly save to db only one time per setup!
+            signals_collection.update_one(
+                {"setup_id": setup_id},
+                {"$setOnInsert": sig_doc},
+                upsert=True,
+            )
+
+        logger.info("Saved analysis to MongoDB (id=%s, signal=%s, is_new_entry=%s)", inserted_id, doc.get("signal"), is_new_entry)
         return inserted_id
     except Exception as exc:
         logger.warning("Failed to store analysis in MongoDB: %s", exc)
@@ -121,11 +134,11 @@ def get_latest_analysis_from_db() -> Optional[Dict[str, Any]]:
 
 
 def get_analysis_history(limit: int = 50) -> List[Dict[str, Any]]:
-    """Retrieve historical analysis records from MongoDB."""
+    """Retrieve historical analysis records from MongoDB ordered DESC (newest first)."""
     if analysis_collection is None:
         return []
     try:
-        cursor = analysis_collection.find().sort("_id", -1).limit(limit)
+        cursor = analysis_collection.find().sort([("timestamp_utc", -1), ("_id", -1)]).limit(limit)
         results = []
         for doc in cursor:
             if "_id" in doc:
@@ -160,6 +173,26 @@ def save_trade_to_db(trade_data: Dict[str, Any]) -> Optional[str]:
     except Exception as exc:
         logger.warning("Failed saving trade to MongoDB: %s", exc)
         return None
+
+
+def get_signals_history(limit: int = 50) -> List[Dict[str, Any]]:
+    """Retrieve confirmed signal setups from MongoDB 'signals' collection ordered DESC (newest first)."""
+    if signals_collection is None:
+        return []
+    try:
+        cursor = signals_collection.find().sort([("timestamp_utc", -1), ("_id", -1)]).limit(limit)
+        results = []
+        for doc in cursor:
+            if "_id" in doc:
+                doc["_id"] = str(doc["_id"])
+            if isinstance(doc.get("created_at"), datetime):
+                doc["created_at"] = doc["created_at"].isoformat()
+            results.append(doc)
+        return results
+    except Exception as exc:
+        logger.warning("Failed retrieving signals history from MongoDB: %s", exc)
+        return []
+
 
 
 if __name__ == "__main__":

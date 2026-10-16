@@ -59,6 +59,7 @@ def get_gold_candles(interval: str = "5min", outputsize: int = 100, use_cache: b
                 "symbol": "XAU/USD",
                 "interval": api_interval,
                 "outputsize": outputsize,
+                "timezone": "UTC",
                 "apikey": api_key,
             },
             timeout=15,
@@ -77,7 +78,7 @@ def get_gold_candles(interval: str = "5min", outputsize: int = 100, use_cache: b
         for column in ["open", "high", "low", "close"]:
             df[column] = pd.to_numeric(df[column], errors="coerce")
 
-        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+        df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
 
         df = (
             df.dropna(subset=["datetime", "open", "high", "low", "close"])

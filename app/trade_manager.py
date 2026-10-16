@@ -2,7 +2,7 @@ import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger("trade-manager")
 
@@ -40,8 +40,33 @@ def save_active_trade(trade: Optional[Dict[str, Any]]) -> None:
         logger.error("Failed to save active trade: %s", exc)
 
 
+_ARCHIVED_TRADE_IDS = set()
+
+
 def archive_closed_trade(trade: Dict[str, Any]) -> None:
-    """Record completed trade to trade_history.jsonl and MongoDB."""
+    """Record completed trade to trade_history.jsonl and MongoDB exactly once."""
+    trade_id = trade.get("id")
+    if not trade_id:
+        return
+
+    # In-memory deduplication
+    if trade_id in _ARCHIVED_TRADE_IDS:
+        logger.debug("Trade %s already archived. Skipping duplicate.", trade_id)
+        return
+
+    # File-based deduplication
+    try:
+        if TRADE_HISTORY_FILE.exists():
+            with TRADE_HISTORY_FILE.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip() and f'"id": "{trade_id}"' in line:
+                        _ARCHIVED_TRADE_IDS.add(trade_id)
+                        return
+    except Exception:
+        pass
+
+    _ARCHIVED_TRADE_IDS.add(trade_id)
+
     try:
         with TRADE_HISTORY_FILE.open("a", encoding="utf-8") as file:
             file.write(json.dumps(trade, default=str) + "\n")
@@ -174,66 +199,67 @@ def process_trade_signal(
                 exit_price = trade_tp
                 exit_reason = f"Take Profit reached at {current_price:.3f} (TP: {trade_tp:.3f})"
 
-        # 2. Historical candlestick check since entry_time
-        # In real trading, if any candle wick crossed SL or TP between cycles or during downtime, the trade was executed!
+        # 2. Historical candlestick check (audit for offline gap periods)
+        # Rule: A live running position must NOT be closed prematurely by its own entry bar or past candles.
+        # Only check closed candles that started strictly AFTER entry_time (at least 5 min after entry),
+        # and only if the trade has been running for at least 10 minutes.
         if not hit_sl and not hit_tp:
             entry_time_str = active_trade.get("entry_time")
-            eval_df = candles_df
-
-            # If candles_df was not passed, dynamically fetch recent market candles to audit the position
-            if eval_df is None and entry_time_str:
-                try:
-                    import pandas as pd
-                    from app.market_data import get_gold_candles
-                    entry_dt = pd.to_datetime(entry_time_str, utc=True)
-                    hours_elapsed = (datetime.now(timezone.utc) - entry_dt.to_pydatetime()).total_seconds() / 3600.0
-                    if hours_elapsed > 4:
-                        eval_df = get_gold_candles(interval="15min", outputsize=min(max(int(hours_elapsed * 4) + 30, 60), 300))
-                    else:
-                        eval_df = get_gold_candles(interval=timeframe or "5min", outputsize=100)
-                except Exception as exc:
-                    logger.debug("Candle audit fetch skipped: %s", exc)
-
-            if eval_df is not None:
+            if entry_time_str:
                 try:
                     import pandas as pd
                     entry_dt = pd.to_datetime(entry_time_str, utc=True)
-                    df_copy = eval_df.copy()
-                    if "datetime" in df_copy.columns:
-                        df_copy["_parsed_dt"] = pd.to_datetime(df_copy["datetime"], utc=True)
-                        df_sorted = df_copy.sort_values("_parsed_dt")
-                        for _, row in df_sorted.iterrows():
-                            if row["_parsed_dt"] >= entry_dt:
-                                c_low = float(row["low"])
-                                c_high = float(row["high"])
-                                c_time = str(row["datetime"])
+                    minutes_elapsed = (datetime.now(timezone.utc) - entry_dt.to_pydatetime()).total_seconds() / 60.0
 
-                                if direction == "BUY":
-                                    if c_low <= trade_sl:
-                                        hit_sl = True
-                                        exit_price = trade_sl
-                                        exit_time = c_time
-                                        exit_reason = f"Stop Loss hit at {trade_sl:.3f} on candle {c_time} (Low was {c_low:.3f})"
-                                        break
-                                    elif c_high >= trade_tp:
-                                        hit_tp = True
-                                        exit_price = trade_tp
-                                        exit_time = c_time
-                                        exit_reason = f"Take Profit reached at {trade_tp:.3f} on candle {c_time} (High was {c_high:.3f})"
-                                        break
-                                else:  # SELL
-                                    if c_high >= trade_sl:
-                                        hit_sl = True
-                                        exit_price = trade_sl
-                                        exit_time = c_time
-                                        exit_reason = f"Stop Loss hit at {trade_sl:.3f} on candle {c_time} (High was {c_high:.3f})"
-                                        break
-                                    elif c_low <= trade_tp:
-                                        hit_tp = True
-                                        exit_price = trade_tp
-                                        exit_time = c_time
-                                        exit_reason = f"Take Profit reached at {trade_tp:.3f} on candle {c_time} (Low was {c_low:.3f})"
-                                        break
+                    # Only audit historical candles if trade has been running for at least 10 minutes
+                    if minutes_elapsed >= 10:
+                        eval_df = candles_df
+                        if eval_df is None:
+                            try:
+                                from app.market_data import get_gold_candles
+                                eval_df = get_gold_candles(interval=timeframe or "5min", outputsize=100)
+                            except Exception as exc:
+                                logger.debug("Candle audit fetch skipped: %s", exc)
+
+                        if eval_df is not None:
+                            df_copy = eval_df.copy()
+                            if "datetime" in df_copy.columns:
+                                df_copy["_parsed_dt"] = pd.to_datetime(df_copy["datetime"], utc=True)
+                                df_sorted = df_copy.sort_values("_parsed_dt")
+                                # STRICT: Must be strictly after the entry candle bar
+                                min_candle_time = entry_dt + pd.Timedelta(minutes=5)
+                                for _, row in df_sorted.iterrows():
+                                    if row["_parsed_dt"] >= min_candle_time:
+                                        c_low = float(row["low"])
+                                        c_high = float(row["high"])
+                                        c_time = str(row["datetime"])
+
+                                        if direction == "BUY":
+                                            if c_low <= trade_sl:
+                                                hit_sl = True
+                                                exit_price = trade_sl
+                                                exit_time = c_time
+                                                exit_reason = f"Stop Loss hit at {trade_sl:.3f} on candle {c_time} (Low was {c_low:.3f})"
+                                                break
+                                            elif c_high >= trade_tp:
+                                                hit_tp = True
+                                                exit_price = trade_tp
+                                                exit_time = c_time
+                                                exit_reason = f"Take Profit reached at {trade_tp:.3f} on candle {c_time} (High was {c_high:.3f})"
+                                                break
+                                        else:  # SELL
+                                            if c_high >= trade_sl:
+                                                hit_sl = True
+                                                exit_price = trade_sl
+                                                exit_time = c_time
+                                                exit_reason = f"Stop Loss hit at {trade_sl:.3f} on candle {c_time} (High was {c_high:.3f})"
+                                                break
+                                            elif c_low <= trade_tp:
+                                                hit_tp = True
+                                                exit_price = trade_tp
+                                                exit_time = c_time
+                                                exit_reason = f"Take Profit reached at {trade_tp:.3f} on candle {c_time} (Low was {c_low:.3f})"
+                                                break
                 except Exception as eval_err:
                     logger.warning("Error checking candlestick history for SL/TP: %s", eval_err)
 
@@ -517,4 +543,43 @@ def reset_active_trade() -> Dict[str, Any]:
         archive_closed_trade(trade)
     save_active_trade(None)
     return {"status": "ok", "message": "Active position reset to flat"}
+
+
+def get_trade_history(limit: int = 50) -> List[Dict[str, Any]]:
+    """Retrieve closed trades history from MongoDB or trade_history.jsonl."""
+    trades = []
+    # 1. Try MongoDB trades collection
+    try:
+        from app.mongo_db import trades_collection
+        if trades_collection is not None:
+            cursor = (
+                trades_collection.find({"status": {"$in": ["CLOSED_SL", "CLOSED_TP", "MANUALLY_CLOSED", "CLOSED"]}})
+                .sort([("exit_time", -1), ("entry_time", -1), ("_id", -1)])
+                .limit(limit)
+            )
+            for doc in cursor:
+                doc["_id"] = str(doc.get("_id", ""))
+                if isinstance(doc.get("created_at"), datetime):
+                    doc["created_at"] = doc["created_at"].isoformat()
+                trades.append(doc)
+            if trades:
+                return trades
+    except Exception:
+        pass
+
+    # 2. Fallback to trade_history.jsonl
+    if TRADE_HISTORY_FILE.exists():
+        try:
+            with TRADE_HISTORY_FILE.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            trades.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    return list(reversed(trades))[:limit]
+
 

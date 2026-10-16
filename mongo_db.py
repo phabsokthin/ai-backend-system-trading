@@ -56,40 +56,77 @@ def check_mongodb() -> Dict[str, Any]:
 
 
 def save_analysis(analysis_data: Dict[str, Any]) -> Optional[str]:
-    """Store analysis result in MongoDB 'analysis' collection."""
+    """Store analysis result in MongoDB 'analysis' collection without duplicates."""
     if analysis_collection is None:
         return None
+
     try:
         doc = dict(analysis_data)
+        timestamp_utc = doc.get("timestamp_utc")
+
+        if timestamp_utc:
+            existing = analysis_collection.find_one({"timestamp_utc": timestamp_utc})
+            if existing:
+                return str(existing["_id"])
+
         if "created_at" not in doc:
             doc["created_at"] = datetime.now(timezone.utc)
+
         result = analysis_collection.insert_one(doc)
         inserted_id = str(result.inserted_id)
 
-        signal = doc.get("signal")
-        if signal in ("BUY", "SELL") or doc.get("has_setup") or doc.get("is_new_entry"):
-            try:
-                sig_doc = {
-                    "analysis_id": inserted_id,
-                    "timestamp_utc": doc.get("timestamp_utc") or datetime.now(timezone.utc).isoformat(),
-                    "symbol": doc.get("symbol", "XAU/USD"),
-                    "signal": signal,
-                    "action": doc.get("action"),
-                    "price": doc.get("price"),
-                    "stop_loss": doc.get("stop_loss") or doc.get("sl"),
-                    "take_profit": doc.get("take_profit") or doc.get("tp"),
-                    "reason": doc.get("reason"),
-                    "setup": doc.get("setup"),
-                    "is_new_entry": doc.get("is_new_entry", False),
-                    "created_at": datetime.now(timezone.utc),
-                }
-                signals_collection.insert_one(sig_doc)
-            except Exception as sig_err:
-                logger.debug("Failed recording to signals_collection: %s", sig_err)
+        is_new_entry = doc.get("is_new_entry", False) or doc.get("action") in ("OPEN_BUY", "OPEN_SELL")
+        if is_new_entry and signals_collection is not None:
+            active_pos = doc.get("active_position") or doc.get("setup") or {}
+            setup_id = active_pos.get("id") or f"setup_{timestamp_utc}_{doc.get('signal')}"
+
+            sig_doc = {
+                "setup_id": setup_id,
+                "analysis_id": inserted_id,
+                "timestamp_utc": timestamp_utc or datetime.now(timezone.utc).isoformat(),
+                "symbol": doc.get("symbol", "XAU/USD"),
+                "signal": doc.get("signal"),
+                "action": doc.get("action"),
+                "price": doc.get("price"),
+                "stop_loss": doc.get("stop_loss") or doc.get("sl"),
+                "take_profit": doc.get("take_profit") or doc.get("tp"),
+                "reason": doc.get("reason"),
+                "setup": doc.get("setup"),
+                "is_new_entry": True,
+                "created_at": datetime.now(timezone.utc),
+            }
+            signals_collection.update_one(
+                {"setup_id": setup_id},
+                {"$setOnInsert": sig_doc},
+                upsert=True,
+            )
 
         return inserted_id
     except Exception as exc:
         logger.warning("Failed saving analysis to MongoDB: %s", exc)
+        return None
+
+
+def save_trade_to_db(trade_data: Dict[str, Any]) -> Optional[str]:
+    """Store or update trade in MongoDB 'trades' collection once."""
+    if trades_collection is None:
+        return None
+    try:
+        doc = dict(trade_data)
+        trade_id = doc.get("id")
+        if trade_id:
+            res = trades_collection.update_one(
+                {"id": trade_id},
+                {"$set": doc, "$setOnInsert": {"created_at": datetime.now(timezone.utc)}},
+                upsert=True,
+            )
+            return str(res.upserted_id or trade_id)
+        else:
+            doc["created_at"] = datetime.now(timezone.utc)
+            res = trades_collection.insert_one(doc)
+            return str(res.inserted_id)
+    except Exception as exc:
+        logger.warning("Failed saving trade to MongoDB: %s", exc)
         return None
 
 

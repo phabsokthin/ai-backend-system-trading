@@ -555,12 +555,13 @@ def gold_analysis(
             "real_orders_enabled": False,
         }
 
-        # Store analysis result in MongoDB
-        try:
-            from app.mongo_db import save_analysis
-            save_analysis(payload)
-        except Exception:
-            pass
+        # Store analysis result in MongoDB only if there is a new confirmed entry
+        if payload.get("is_new_entry"):
+            try:
+                from app.mongo_db import save_analysis
+                save_analysis(payload)
+            except Exception:
+                pass
 
         return payload
 
@@ -861,6 +862,7 @@ def news_refresh():
         )
 
 
+@app.get("/api/analysis/latest")
 @app.get("/analysis/latest")
 def latest_scheduled_analysis():
     """Retrieve the most recent scheduled analysis result."""
@@ -868,6 +870,32 @@ def latest_scheduled_analysis():
     if data is None:
         raise HTTPException(status_code=404, detail="No scheduled analysis recorded yet")
     return data
+
+
+@app.get("/api/trades/history")
+@app.get("/trades/history")
+def get_trades_history(limit: int = Query(50, ge=1, le=500)):
+    """Retrieve completed trade history records."""
+    from app.trade_manager import get_trade_history
+    records = get_trade_history(limit=limit)
+    return {
+        "success": True,
+        "count": len(records),
+        "trades": records,
+    }
+
+
+@app.get("/api/signals/history")
+@app.get("/signals/history")
+def get_signals_history_endpoint(limit: int = Query(50, ge=1, le=500)):
+    """Retrieve confirmed AI signal trade setups."""
+    from app.mongo_db import get_signals_history
+    records = get_signals_history(limit=limit)
+    return {
+        "success": True,
+        "count": len(records),
+        "signals": records,
+    }
 
 
 @app.get("/api/analysis/history")
@@ -898,3 +926,18 @@ def get_mongodb_status():
         except Exception as e:
             status["collections_error"] = str(e)
     return status
+
+
+
+@app.get("/api/report")
+def get_trading_report_endpoint(limit: int = Query(100, ge=1, le=500)):
+    """Retrieve comprehensive trading performance, analytics, and active setup report."""
+    from app.report import generate_trading_report
+    return generate_trading_report(trade_limit=limit)
+
+
+@app.get("/api/report/summary")
+def get_performance_summary_endpoint():
+    """Retrieve quick trading KPI performance summary."""
+    from app.report import get_performance_summary
+    return get_performance_summary()
