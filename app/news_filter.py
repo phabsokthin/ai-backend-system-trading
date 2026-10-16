@@ -15,9 +15,10 @@ MAX_CALENDAR_AGE_HOURS = 24
 
 
 def get_events_file() -> Path:
-    for candidate in [ROOT_DIR / "events.json", APP_DIR / "events.json"]:
-        if candidate.exists():
-            return candidate
+    candidates = [APP_DIR / "events.json", ROOT_DIR / "events.json"]
+    valid = [c for c in candidates if c.exists() and c.stat().st_size > 10]
+    if valid:
+        return max(valid, key=lambda f: f.stat().st_mtime)
     return ROOT_DIR / "events.json"
 
 
@@ -32,12 +33,18 @@ def analyze_news_events(events: List[Dict[str, Any]], now: datetime) -> Dict[str
     today_utc = now.date()
     todays_events: List[Dict[str, Any]] = []
     upcoming_events: List[Dict[str, Any]] = []
+    recent_past_events: List[Dict[str, Any]] = []
     active_blocking_event: Optional[Dict[str, Any]] = None
     next_event: Optional[Dict[str, Any]] = None
     min_future_delta_minutes: Optional[float] = None
 
     for item in events:
-        if not isinstance(item, dict) or item.get("impact") != "high":
+        if not isinstance(item, dict):
+            continue
+
+        impact_str = str(item.get("impact", "")).strip().lower()
+        impact_score = item.get("impactScore") or item.get("impact_score")
+        if impact_str != "high" and impact_score != 3:
             continue
 
         raw_time = item.get("time")
@@ -45,27 +52,32 @@ def analyze_news_events(events: List[Dict[str, Any]], now: datetime) -> Dict[str
             continue
 
         try:
-            event_time = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            event_time = datetime.fromisoformat(str(raw_time).replace("Z", "+00:00"))
             if event_time.tzinfo is None:
-                continue
+                event_time = event_time.replace(tzinfo=timezone.utc)
 
-            currency = item.get("currency", "USD")
+            currency = str(item.get("currency", "USD")).upper()
             event_record = {
                 "name": item.get("name") or item.get("title", "High Impact Event"),
                 "title": item.get("title") or item.get("name", "High Impact Event"),
                 "time": event_time.isoformat(),
                 "currency": currency,
                 "impact": "high",
-                "forecast": item.get("forecast"),
-                "previous": item.get("previous"),
+                "forecast": item.get("forecast") or "—",
+                "previous": item.get("previous") or "—",
                 "actual": item.get("actual"),
             }
+
+            delta_minutes = (event_time - now).total_seconds() / 60.0
 
             # Check if today
             if event_time.date() == today_utc:
                 todays_events.append(event_record)
-
-            delta_minutes = (event_time - now).total_seconds() / 60.0
+                if delta_minutes <= 0:
+                    recent_past_events.append({
+                        **event_record,
+                        "minutes_ago": round(abs(delta_minutes), 1),
+                    })
 
             # Check if in block window (e.g. 15m before to 15m after)
             if -BLOCK_AFTER_MINUTES <= delta_minutes <= BLOCK_BEFORE_MINUTES:
@@ -115,6 +127,12 @@ def analyze_news_events(events: List[Dict[str, Any]], now: datetime) -> Dict[str
             f"Technical setups are permitted, but monitor positions ahead of release."
         )
         status = "CLEAR"
+    elif upcoming_events:
+        market_news_note = (
+            f"UPCOMING NEWS AHEAD: Next high-impact event '{upcoming_events[0]['name']}' "
+            f"in {upcoming_events[0]['hours_until']} hours. Market conditions clear for technical execution."
+        )
+        status = "CLEAR"
     else:
         market_news_note = (
             "CLEAR NEWS CALENDAR: No major high-impact US economic events scheduled in the immediate horizon. "
@@ -129,7 +147,8 @@ def analyze_news_events(events: List[Dict[str, Any]], now: datetime) -> Dict[str
         "todays_events": todays_events,
         "active_blocking_event": active_blocking_event,
         "next_event": next_event,
-        "upcoming_events": upcoming_events[:5],
+        "upcoming_events": upcoming_events[:8],
+        "recent_past_events": recent_past_events,
         "market_news_note": market_news_note,
     }
 
@@ -167,31 +186,25 @@ def check_news_filter() -> dict:
             }
 
         updated_at = datetime.fromisoformat(
-            data["updated_at"].replace("Z", "+00:00")
+            str(data["updated_at"]).replace("Z", "+00:00")
         )
 
         if updated_at.tzinfo is None:
-            return {
-                "allowed": False,
-                "reason": "Calendar timestamp must include a timezone",
-                "news_analysis": None,
-            }
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
 
         now = datetime.now(timezone.utc)
 
-        # Check staleness (> 24 hours) - try refreshing if stale
+        # Check staleness (> 24 hours) - attempt refresh if stale but do NOT destroy news_analysis if refresh fails
+        stale_note = ""
         if now - updated_at > timedelta(hours=MAX_CALENDAR_AGE_HOURS):
             try:
                 from app.news_fetcher import refresh_news_calendar
                 refresh_res = refresh_news_calendar()
                 data = json.loads(events_file.read_text(encoding="utf-8"))
-                updated_at = datetime.fromisoformat(data["updated_at"].replace("Z", "+00:00"))
-            except Exception:
-                return {
-                    "allowed": False,
-                    "reason": "News calendar is stale (> 24h old)",
-                    "news_analysis": None,
-                }
+                updated_at = datetime.fromisoformat(str(data["updated_at"]).replace("Z", "+00:00"))
+            except Exception as refresh_err:
+                logger.debug("News auto-refresh deferred: %s", refresh_err)
+                stale_note = " (Calendar cache active)"
 
         events = data.get("events", [])
         if not isinstance(events, list):
@@ -202,6 +215,8 @@ def check_news_filter() -> dict:
             }
 
         news_analysis = analyze_news_events(events, now)
+        if stale_note and news_analysis:
+            news_analysis["market_news_note"] = news_analysis["market_news_note"] + stale_note
 
         if news_analysis["active_blocking_event"]:
             active = news_analysis["active_blocking_event"]

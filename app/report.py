@@ -242,18 +242,20 @@ def generate_trading_report(trade_limit: int = 100) -> Dict[str, Any]:
 
         # 5. Extract upcoming news if available
         upcoming_news: List[Dict[str, Any]] = []
-        news_file = Path(__file__).resolve().parent.parent / "events.json"
+        from app.news_filter import get_events_file
+        news_file = get_events_file()
         if news_file.exists():
             try:
-                events_data = json.loads(news_file.read_text(encoding="utf-8"))
-                if isinstance(events_data, list):
-                    for evt in events_data[:4]:
+                raw_json = json.loads(news_file.read_text(encoding="utf-8"))
+                events_list = raw_json.get("events") if isinstance(raw_json, dict) else (raw_json if isinstance(raw_json, list) else [])
+                if isinstance(events_list, list):
+                    for evt in events_list[:6]:
                         upcoming_news.append({
                             "time": evt.get("time") or evt.get("date", "Today"),
-                            "currency": evt.get("country", "USD"),
-                            "impact": evt.get("impact", "HIGH"),
-                            "title": evt.get("title") or evt.get("name", "Economic Event"),
-                            "forecast": evt.get("forecast") or evt.get("previous") or "High Volatility",
+                            "currency": evt.get("currency") or evt.get("country", "USD"),
+                            "impact": str(evt.get("impact", "HIGH")).upper(),
+                            "title": evt.get("title") or evt.get("name", "High Impact Event"),
+                            "forecast": f"F: {evt.get('forecast')}" if evt.get('forecast') else (evt.get("previous") or "High Volatility"),
                         })
             except Exception as e:
                 logger.warning("Could not read events.json for report: %s", e)

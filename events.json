@@ -1,9 +1,9 @@
 {
   "verified": true,
-  "updated_at": "2026-10-16T06:54:23.305334+00:00",
+  "updated_at": "2026-10-16T07:26:33.884379+00:00",
   "source": "http://127.0.0.1:3000/api/v1/high-impact",
   "source_date": "2026-10-16",
-  "source_timestamp": "2026-10-16T06:52:06.371Z",
+  "source_timestamp": "2026-10-16T07:26:33.879Z",
   "timezone_used": "Asia/Phnom_Penh",
   "events": [
     {
