@@ -28,6 +28,7 @@ from app.trade_manager import (
     reset_active_trade,
     sync_active_position,
 )
+from app.market_hours import is_market_closed, get_market_status
 
 from app.live_market import market
 from pydantic import BaseModel, Field
@@ -124,6 +125,13 @@ def health():
     }
 
 
+@app.get("/api/market/status")
+@app.get("/market/status")
+def market_status():
+    """Return whether the gold market is currently open or closed (weekends, holidays)."""
+    return get_market_status()
+
+
 @app.get("/api/live-price")
 def get_live_price():
     """Fast real-time price snapshot from MT5 terminal or Twelve Data."""
@@ -218,24 +226,28 @@ def get_candles_for_nextjs(
     try:
         mt5_df = get_mt5_candles(symbol=symbol, interval=interval, limit=limit)
         if mt5_df is not None and len(mt5_df) > 0:
-            if include_indicators:
-                candles_data = format_candles_for_frontend(mt5_df, limit=limit)
-            else:
-                recent = mt5_df.tail(limit).copy()
-                recent["datetime"] = recent["datetime"].astype(str)
-                candles_data = recent.to_dict(orient="records")
+            market_closed, _ = is_market_closed()
+            latest_time = float(mt5_df.iloc[-1]["time"]) if "time" in mt5_df.columns else 0
+            is_stale = (not market_closed) and (time.time() - latest_time > 1500)
+            if not is_stale:
+                if include_indicators:
+                    candles_data = format_candles_for_frontend(mt5_df, limit=limit)
+                else:
+                    recent = mt5_df.tail(limit).copy()
+                    recent["datetime"] = recent["datetime"].astype(str)
+                    candles_data = recent.to_dict(orient="records")
 
-            current_price = float(mt5_df.iloc[-1]["close"]) if len(mt5_df) > 0 else None
-            return {
-                "success": True,
-                "symbol": symbol,
-                "interval": interval,
-                "count": len(candles_data),
-                "current_price": current_price,
-                "connection_status": "connected",
-                "source": "MetaTrader 5",
-                "candles": candles_data,
-            }
+                current_price = float(mt5_df.iloc[-1]["close"]) if len(mt5_df) > 0 else None
+                return {
+                    "success": True,
+                    "symbol": symbol,
+                    "interval": interval,
+                    "count": len(candles_data),
+                    "current_price": current_price,
+                    "connection_status": "connected",
+                    "source": "MetaTrader 5",
+                    "candles": candles_data,
+                }
     except Exception:
         pass
 

@@ -56,7 +56,20 @@ def scheduled_analysis():
         logger.info("Starting scheduled XAU/USD multi-timeframe analysis")
 
         # Fetch 5min entry candles and 1h macro candles
-        entry_candles = get_gold_candles(interval="5min", outputsize=100)
+        entry_candles = None
+        try:
+            entry_candles = get_gold_candles(interval="5min", outputsize=100)
+        except Exception as e:
+            logger.warning("Twelve Data entry candle fetch failed: %s. Trying MT5...", e)
+            try:
+                from app.mt5_bridge import get_mt5_candles
+                entry_candles = get_mt5_candles("XAUUSD", "5min", limit=100)
+            except Exception:
+                pass
+
+        if entry_candles is None or len(entry_candles) == 0:
+            raise RuntimeError("Could not fetch entry candles from Twelve Data or MT5")
+
         htf_candles = None
         try:
             htf_candles = get_gold_candles(interval="1h", outputsize=100)

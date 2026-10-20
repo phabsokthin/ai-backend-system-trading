@@ -216,8 +216,14 @@ def process_trade_signal(
                         eval_df = candles_df
                         if eval_df is None:
                             try:
+                                from app.mt5_bridge import get_mt5_candles
+                                eval_df = get_mt5_candles("XAUUSD", timeframe or "5min", limit=50)
+                            except Exception:
+                                eval_df = None
+                        if eval_df is None:
+                            try:
                                 from app.market_data import get_gold_candles
-                                eval_df = get_gold_candles(interval=timeframe or "5min", outputsize=100)
+                                eval_df = get_gold_candles(interval=timeframe or "5min", outputsize=50)
                             except Exception as exc:
                                 logger.debug("Candle audit fetch skipped: %s", exc)
 
@@ -275,6 +281,12 @@ def process_trade_signal(
             archive_closed_trade(active_trade)
             save_active_trade(None)
 
+            try:
+                from app.mt5_bridge import close_position
+                close_position(symbol="XAUUSD")
+            except Exception:
+                pass
+
             logger.info("Closed %s on TP: %s", direction, active_trade["exit_reason"])
 
             return {
@@ -305,6 +317,12 @@ def process_trade_signal(
 
             archive_closed_trade(active_trade)
             save_active_trade(None)
+
+            try:
+                from app.mt5_bridge import close_position
+                close_position(symbol="XAUUSD")
+            except Exception:
+                pass
 
             logger.info("Closed %s on SL: %s", direction, active_trade["exit_reason"])
 
@@ -504,7 +522,24 @@ def sync_active_position(
     if active_trade is None or active_trade.get("status") != "OPEN":
         return {"active": False, "trade_status": "FLAT", "position": None}
 
-    # If current_price is not provided, fetch current candle close
+    # 1. Fetch live price prioritizing real-time MT5 tick and LiveMarket WebSocket
+    if current_price is None or current_price <= 0:
+        try:
+            from app.mt5_bridge import get_mt5_live_tick
+            tick = get_mt5_live_tick("XAUUSD")
+            if tick and tick.get("price") and tick["price"] > 0:
+                current_price = float(tick["price"])
+        except Exception:
+            pass
+
+    if current_price is None or current_price <= 0:
+        try:
+            from app.live_market import market
+            if market.current_price and market.current_price > 0:
+                current_price = float(market.current_price)
+        except Exception:
+            pass
+
     if current_price is None or current_price <= 0:
         try:
             from app.market_data import get_gold_candles
@@ -512,7 +547,25 @@ def sync_active_position(
             if recent is not None and len(recent) > 0:
                 current_price = float(recent.iloc[-1]["close"])
         except Exception:
-            current_price = float(active_trade.get("entry_price", 0))
+            pass
+
+    if current_price is None or current_price <= 0:
+        current_price = float(active_trade.get("entry_price", 0))
+
+    # 2. Fetch candles for historical candle audit (prioritizing MT5)
+    if candles_df is None:
+        try:
+            from app.mt5_bridge import get_mt5_candles
+            candles_df = get_mt5_candles("XAUUSD", "5min", limit=50)
+        except Exception:
+            candles_df = None
+
+    if candles_df is None:
+        try:
+            from app.market_data import get_gold_candles
+            candles_df = get_gold_candles(interval="5min", outputsize=50)
+        except Exception:
+            candles_df = None
 
     exec_result = process_trade_signal(
         current_price=current_price,
