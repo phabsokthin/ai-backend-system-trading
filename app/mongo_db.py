@@ -176,22 +176,59 @@ def save_trade_to_db(trade_data: Dict[str, Any]) -> Optional[str]:
 
 
 def get_signals_history(limit: int = 50) -> List[Dict[str, Any]]:
-    """Retrieve confirmed signal setups from MongoDB 'signals' collection ordered DESC (newest first)."""
-    if signals_collection is None:
-        return []
+    """Retrieve confirmed signal setups from MongoDB 'signals' collection or fallback to analysis.jsonl."""
+    if signals_collection is not None:
+        try:
+            cursor = signals_collection.find().sort([("timestamp_utc", -1), ("_id", -1)]).limit(limit)
+            results = []
+            for doc in cursor:
+                if "_id" in doc:
+                    doc["_id"] = str(doc["_id"])
+                if isinstance(doc.get("created_at"), datetime):
+                    doc["created_at"] = doc["created_at"].isoformat()
+                results.append(doc)
+            if results:
+                return results
+        except Exception as exc:
+            logger.warning("Failed retrieving signals history from MongoDB: %s", exc)
+
+    # Fallback to scanning logs/analysis.jsonl for recorded trade setups
     try:
-        cursor = signals_collection.find().sort([("timestamp_utc", -1), ("_id", -1)]).limit(limit)
-        results = []
-        for doc in cursor:
-            if "_id" in doc:
-                doc["_id"] = str(doc["_id"])
-            if isinstance(doc.get("created_at"), datetime):
-                doc["created_at"] = doc["created_at"].isoformat()
-            results.append(doc)
-        return results
-    except Exception as exc:
-        logger.warning("Failed retrieving signals history from MongoDB: %s", exc)
-        return []
+        from pathlib import Path
+        import json
+        analysis_file = Path(__file__).resolve().parent.parent / "logs" / "analysis.jsonl"
+        if analysis_file.exists():
+            signals = []
+            with analysis_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        if record.get("has_setup") or (record.get("signal") and record.get("signal") in ["BUY", "SELL"]):
+                            sig_item = {
+                                "id": f"signal_{record.get('timestamp_utc', '').replace(':', '_').replace('.', '_')}_{record.get('signal', 'SETUP')}",
+                                "symbol": record.get("symbol", "XAU/USD"),
+                                "signal": record.get("signal"),
+                                "action": record.get("action"),
+                                "price": record.get("price"),
+                                "stop_loss": record.get("stop_loss") or record.get("sl"),
+                                "take_profit": record.get("take_profit") or record.get("tp"),
+                                "confidence": (record.get("setup") or {}).get("confidence", "HIGH"),
+                                "reason": record.get("reason"),
+                                "setup": record.get("setup"),
+                                "timestamp_utc": record.get("timestamp_utc"),
+                            }
+                            signals.append(sig_item)
+                    except Exception:
+                        pass
+            if signals:
+                return list(reversed(signals))[:limit]
+    except Exception as file_err:
+        logger.warning("Fallback reading analysis.jsonl for signals failed: %s", file_err)
+
+    return []
 
 
 
