@@ -131,13 +131,14 @@ def scheduled_analysis():
             candles_df=entry_candles,
         )
 
-        # Handle trade closure (SL hit or TP hit)
+        # Handle trade closure (SL hit or TP hit or offline expiration)
         trade_action = trade_exec.get("action", "")
         trade_status = trade_exec.get("trade_status", "")
-        is_closed = trade_action in ("CLOSE_SL", "CLOSE_TP") or trade_status in ("CLOSED_SL", "CLOSED_TP")
+        is_closed = trade_action in ("CLOSE_SL", "CLOSE_TP", "CLOSE_INVALID", "CLOSE_OFFLINE") or trade_status in ("CLOSED_SL", "CLOSED_TP", "CLOSED_INVALID", "CLOSED_OFFLINE")
 
         # Use effective SL and TP only if an active position exists or a new entry is confirmed
         if is_closed and not trade_exec.get("is_new_entry"):
+            signal = "WAIT"
             effective_sl = None
             effective_tp = None
             setup = None
@@ -159,7 +160,10 @@ def scheduled_analysis():
                     effective_tp2 = trade_exec.get("tp2") or (risk_levels.get("tp2") if risk_levels else base_setup.get("tp2")) or effective_tp
                     effective_tp3 = trade_exec.get("tp3") or (risk_levels.get("tp3") if risk_levels else base_setup.get("tp3"))
 
+                setup_uid = (trade_exec.get("active_position") or {}).get("id") or f"setup_{started_at}_{raw_signal}"
                 setup = {
+                    "id": setup_uid,
+                    "setup_id": setup_uid,
                     "status": "PENDING_NEWS_CLEARANCE" if news_blocked else trade_status or "ACTIVE",
                     "direction": raw_signal,
                     "entry_price": trade_exec.get("entry_price", price),
@@ -188,8 +192,9 @@ def scheduled_analysis():
             "duplicate_prevented": trade_exec.get("duplicate_prevented"),
             "trade_status": trade_exec.get("trade_status"),
             "message": trade_exec.get("message"),
-            "reason": reason,
+            "reason": reason or trade_exec.get("message") or "Market analysis completed",
             "price": price,
+            "current_price": price,
             "has_setup": bool(setup),
             "take_profit": effective_tp,
             "stop_loss": effective_sl,

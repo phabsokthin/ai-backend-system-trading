@@ -29,13 +29,19 @@ def load_active_trade() -> Optional[Dict[str, Any]]:
 
 
 def save_active_trade(trade: Optional[Dict[str, Any]]) -> None:
-    """Save or clear the currently active trade."""
+    """Save or clear the currently active trade in both local cache and MongoDB."""
     try:
         if trade is None or trade.get("status") != "OPEN":
             if ACTIVE_TRADE_FILE.exists():
                 ACTIVE_TRADE_FILE.unlink(missing_ok=True)
         else:
             ACTIVE_TRADE_FILE.write_text(json.dumps(trade, indent=2), encoding="utf-8")
+            # STORE TO DB: Guarantee open trade is stored in MongoDB trades collection
+            try:
+                from app.mongo_db import save_trade_to_db
+                save_trade_to_db(trade)
+            except Exception as db_err:
+                logger.debug("Failed saving active trade to MongoDB: %s", db_err)
     except Exception as exc:
         logger.error("Failed to save active trade: %s", exc)
 
@@ -203,6 +209,7 @@ def process_trade_signal(
         # Rule: A live running position must NOT be closed prematurely by its own entry bar or past candles.
         # Only check closed candles that started strictly AFTER entry_time (at least 5 min after entry),
         # and only if the trade has been running for at least 10 minutes.
+        hit_offline = False
         if not hit_sl and not hit_tp:
             entry_time_str = active_trade.get("entry_time")
             if entry_time_str:
@@ -211,8 +218,13 @@ def process_trade_signal(
                     entry_dt = pd.to_datetime(entry_time_str, utc=True)
                     minutes_elapsed = (datetime.now(timezone.utc) - entry_dt.to_pydatetime()).total_seconds() / 60.0
 
-                    # Only audit historical candles if trade has been running for at least 10 minutes
-                    if minutes_elapsed >= 10:
+                    # If server stopped for over 24 hours (>1 day offline), mark stale scalp position as expired
+                    if minutes_elapsed >= 1440:
+                        hit_offline = True
+                        exit_price = current_price
+                        exit_time = now_utc
+                        exit_reason = f"Position expired after system restart (>24h offline gap, opened at {entry_time_str})"
+                    elif minutes_elapsed >= 10:
                         eval_df = candles_df
                         if eval_df is None:
                             try:
@@ -341,6 +353,43 @@ def process_trade_signal(
                 "pnl_points": pnl_points,
                 "active_position": None,
                 "message": f"🛑 STOP LOSS HIT: {direction} stopped out at {exit_price:.3f} ({pnl_points:.2f} pts loss). Waiting for new setup.",
+            }
+
+        # Check if trade expired during extended offline downtime (>24 hours)
+        if hit_offline:
+            pnl_points = round(exit_price - entry_price, 3) if direction == "BUY" else round(entry_price - exit_price, 3)
+            active_trade["status"] = "CLOSED_OFFLINE"
+            active_trade["exit_price"] = exit_price
+            active_trade["exit_time"] = exit_time
+            active_trade["final_pnl_points"] = pnl_points
+            active_trade["exit_reason"] = exit_reason
+
+            archive_closed_trade(active_trade)
+            save_active_trade(None)
+
+            try:
+                from app.mt5_bridge import close_position
+                close_position(symbol="XAUUSD")
+            except Exception:
+                pass
+
+            logger.info("Closed %s on offline expiration: %s", direction, active_trade["exit_reason"])
+
+            return {
+                "action": "CLOSE_OFFLINE",
+                "is_new_entry": False,
+                "duplicate_prevented": False,
+                "signal": "WAIT",
+                "trade_status": "CLOSED_OFFLINE",
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "stop_loss": trade_sl,
+                "take_profit": trade_tp,
+                "sl": trade_sl,
+                "tp": trade_tp,
+                "pnl_points": pnl_points,
+                "active_position": None,
+                "message": f"⏳ OFFLINE EXPIRATION: {direction} closed at {exit_price:.3f} (system stopped over 1 day). Resetting to flat.",
             }
 
         # Trade is still active!
@@ -606,7 +655,7 @@ def get_trade_history(limit: int = 50) -> List[Dict[str, Any]]:
         from app.mongo_db import trades_collection
         if trades_collection is not None:
             cursor = (
-                trades_collection.find({"status": {"$in": ["CLOSED_SL", "CLOSED_TP", "MANUALLY_CLOSED", "CLOSED"]}})
+                trades_collection.find({"status": {"$in": ["CLOSED_SL", "CLOSED_TP", "MANUALLY_CLOSED", "CLOSED", "CLOSED_OFFLINE"]}})
                 .sort([("exit_time", -1), ("entry_time", -1), ("_id", -1)])
                 .limit(limit)
             )
@@ -615,12 +664,12 @@ def get_trade_history(limit: int = 50) -> List[Dict[str, Any]]:
                 if isinstance(doc.get("created_at"), datetime):
                     doc["created_at"] = doc["created_at"].isoformat()
                 trades.append(doc)
-            if trades:
-                return trades
+            # CRITICAL: Return MongoDB trades directly (even if empty). Do NOT fall back to file logs when user deleted records!
+            return trades
     except Exception:
         pass
 
-    # 2. Fallback to trade_history.jsonl
+    # 2. Fallback to trade_history.jsonl ONLY if MongoDB is unavailable
     if TRADE_HISTORY_FILE.exists():
         try:
             with TRADE_HISTORY_FILE.open("r", encoding="utf-8") as f:
@@ -634,5 +683,67 @@ def get_trade_history(limit: int = 50) -> List[Dict[str, Any]]:
         except Exception:
             pass
     return list(reversed(trades))[:limit]
+
+
+def delete_trade_everywhere(trade_id: str) -> bool:
+    """Delete trade from MongoDB, disk cache, and trade history file."""
+    deleted = False
+
+    # 1. MongoDB
+    try:
+        from app.mongo_db import delete_trade_from_db
+        if delete_trade_from_db(trade_id):
+            deleted = True
+    except Exception as exc:
+        logger.warning("Error deleting trade %s from DB: %s", trade_id, exc)
+
+    # 2. Active trade file if matching
+    active = load_active_trade()
+    if active and (active.get("id") == trade_id or str(active.get("ticket")) == str(trade_id)):
+        save_active_trade(None)
+        deleted = True
+
+    # 3. Clean from trade_history.jsonl
+    if TRADE_HISTORY_FILE.exists():
+        try:
+            remaining_lines = []
+            with TRADE_HISTORY_FILE.open("r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip() and f'"id": "{trade_id}"' not in line:
+                        remaining_lines.append(line.strip())
+            with TRADE_HISTORY_FILE.open("w", encoding="utf-8") as f:
+                for l in remaining_lines:
+                    f.write(l + "\n")
+            deleted = True
+        except Exception as file_err:
+            logger.warning("Error pruning trade_history.jsonl: %s", file_err)
+
+    if trade_id in _ARCHIVED_TRADE_IDS:
+        _ARCHIVED_TRADE_IDS.discard(trade_id)
+
+    return deleted
+
+
+def clear_all_trades_everywhere() -> bool:
+    """Clear all trades from MongoDB, disk cache, and trade history file."""
+    # 1. MongoDB
+    try:
+        from app.mongo_db import clear_all_trades_from_db
+        clear_all_trades_from_db()
+    except Exception as exc:
+        logger.warning("Error clearing trades in DB: %s", exc)
+
+    # 2. Clear active trade
+    save_active_trade(None)
+
+    # 3. Truncate trade_history.jsonl
+    if TRADE_HISTORY_FILE.exists():
+        try:
+            TRADE_HISTORY_FILE.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+
+    _ARCHIVED_TRADE_IDS.clear()
+    return True
 
 

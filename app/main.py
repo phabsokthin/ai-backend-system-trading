@@ -498,16 +498,30 @@ def gold_analysis(
             candles_df=entry_candles,
         )
 
-        effective_sl = trade_exec.get("sl", potential_sl)
-        effective_tp = trade_exec.get("tp", potential_tp)
+        trade_action = trade_exec.get("action", "")
+        trade_status = trade_exec.get("trade_status", "")
+        is_closed = trade_action in ("CLOSE_SL", "CLOSE_TP", "CLOSE_INVALID", "CLOSE_OFFLINE") or trade_status in ("CLOSED_SL", "CLOSED_TP", "CLOSED_INVALID", "CLOSED_OFFLINE")
 
-        # Build auto setup structure
-        setup_data = None
-        if technical_setup or risk_calc:
-            base_setup = technical_setup or {}
-            setup_status = "PENDING_NEWS_CLEARANCE" if news_blocked else trade_exec.get("trade_status", "ACTIVE")
+        if is_closed and not trade_exec.get("is_new_entry"):
+            final_signal = "WAIT"
+            effective_sl = None
+            effective_tp = None
+            setup_data = None
+            has_setup = False
+        else:
+            effective_sl = trade_exec.get("sl", potential_sl)
+            effective_tp = trade_exec.get("tp", potential_tp)
 
+            # Build auto setup structure
+            setup_data = None
+            if technical_setup or risk_calc:
+                base_setup = technical_setup or {}
+                setup_status = "PENDING_NEWS_CLEARANCE" if news_blocked else trade_exec.get("trade_status", "ACTIVE")
+
+            setup_uid = (trade_exec.get("active_position") or {}).get("id") or f"setup_{datetime.now(timezone.utc).isoformat()}_{raw_signal}"
             setup_data = {
+                "id": setup_uid,
+                "setup_id": setup_uid,
                 "status": setup_status,
                 "direction": raw_signal,
                 "entry_price": trade_exec.get("entry_price", price),
@@ -535,13 +549,14 @@ def gold_analysis(
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "symbol": "XAU/USD",
             "price": price,
+            "current_price": price,
             "action": trade_exec.get("action"),
             "signal": final_signal,
             "is_new_entry": trade_exec.get("is_new_entry"),
             "duplicate_prevented": trade_exec.get("duplicate_prevented"),
             "trade_status": trade_exec.get("trade_status"),
             "message": trade_exec.get("message"),
-            "reason": final_reason,
+            "reason": final_reason or trade_exec.get("message") or "Analysis completed",
             "has_setup": has_setup,
             "take_profit": effective_tp,
             "stop_loss": effective_sl,
@@ -876,11 +891,23 @@ def news_refresh():
 
 @app.get("/api/analysis/latest")
 @app.get("/analysis/latest")
+@app.get("/api/signals/latest")
+@app.get("/signals/latest")
 def latest_scheduled_analysis():
     """Retrieve the most recent scheduled analysis result."""
     data = get_latest_analysis()
     if data is None:
+        from app.mongo_db import get_latest_analysis_from_db
+        data = get_latest_analysis_from_db()
+    if data is None:
         raise HTTPException(status_code=404, detail="No scheduled analysis recorded yet")
+    if isinstance(data, dict):
+        if "current_price" not in data and "price" in data:
+            data["current_price"] = data["price"]
+        elif "price" not in data and "current_price" in data:
+            data["price"] = data["current_price"]
+        if not data.get("reason"):
+            data["reason"] = data.get("message") or "Technical analysis evaluated"
     return data
 
 
@@ -953,3 +980,39 @@ def get_performance_summary_endpoint():
     """Retrieve quick trading KPI performance summary."""
     from app.report import get_performance_summary
     return get_performance_summary()
+
+
+@app.delete("/api/trades/{trade_id}")
+@app.delete("/trades/{trade_id}")
+def delete_trade_endpoint(trade_id: str):
+    """Delete a specific trade from database and logs."""
+    from app.trade_manager import delete_trade_everywhere
+    success = delete_trade_everywhere(trade_id)
+    return {"success": success, "deleted_id": trade_id}
+
+
+@app.delete("/api/trades")
+@app.delete("/trades/clear")
+def clear_all_trades_endpoint():
+    """Clear all historical and active trades from database and logs."""
+    from app.trade_manager import clear_all_trades_everywhere
+    clear_all_trades_everywhere()
+    return {"success": True, "message": "All trades cleared from database and files"}
+
+
+@app.delete("/api/signals/{signal_id}")
+@app.delete("/signals/{signal_id}")
+def delete_signal_endpoint(signal_id: str):
+    """Delete a specific signal setup from database."""
+    from app.mongo_db import delete_signal_from_db
+    success = delete_signal_from_db(signal_id)
+    return {"success": success, "deleted_id": signal_id}
+
+
+@app.delete("/api/signals")
+@app.delete("/signals/clear")
+def clear_all_signals_endpoint():
+    """Clear all signals from database."""
+    from app.mongo_db import clear_all_signals_from_db
+    count = clear_all_signals_from_db()
+    return {"success": True, "message": f"Cleared {count} signals from database"}
