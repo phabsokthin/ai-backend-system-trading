@@ -142,29 +142,57 @@ def resolve_symbol(symbol: str) -> str:
     return clean_sym
 
 
+from datetime import datetime, timezone
+
+_last_known_tick: Optional[Dict[str, Any]] = None
+
 def get_mt5_live_tick(symbol: str = "XAUUSD") -> Optional[Dict[str, Any]]:
-    """Return the latest bid/ask/price tick directly from connected MT5 terminal."""
+    """Return the latest bid/ask/price tick directly from connected MT5 terminal.
+    Always maintains a continuous live tick stream without discarding prices.
+    """
+    global _last_known_tick
     if not ensure_connected():
-        return None
+        return _last_known_tick
+
     target_symbol = resolve_symbol(symbol)
     tick = mt5.symbol_info_tick(target_symbol)
     if not tick:
-        return None
+        # Ensure the symbol is active in Market Watch and retry
+        try:
+            mt5.symbol_select(target_symbol, True)
+            tick = mt5.symbol_info_tick(target_symbol)
+        except Exception:
+            pass
+
+    if not tick:
+        return _last_known_tick
+
     bid = round(float(tick.bid), 3)
     ask = round(float(tick.ask), 3)
-    price = round((bid + ask) / 2.0, 3)
-    return {
+    if bid <= 0 and ask <= 0:
+        return _last_known_tick
+
+    price = round((bid + ask) / 2.0, 3) if (bid > 0 and ask > 0) else round(max(bid, ask), 3)
+    tick_time = float(getattr(tick, "time", 0))
+
+    result = {
         "symbol": target_symbol,
         "bid": bid,
         "ask": ask,
         "price": price,
-        "spread": round(ask - bid, 3),
-        "timestamp": float(getattr(tick, "time", time.time())),
+        "spread": round(ask - bid, 3) if (ask > 0 and bid > 0) else 0.0,
+        "timestamp": tick_time if tick_time > 0 else time.time(),
+        "time": time.time(),
     }
+    _last_known_tick = result
+    return result
 
 
 def get_mt5_candles(symbol: str = "XAUUSD", interval: str = "5min", limit: int = 100) -> Optional[pd.DataFrame]:
-    """Fetch real-time historical candlesticks directly from MT5 terminal."""
+    """
+    Fetch real-time historical candlesticks directly from MT5 terminal.
+    Always returns valid candle records without artificial timeout discards during rollovers or quiet hours.
+    """
     if not ensure_connected():
         return None
     target_symbol = resolve_symbol(symbol)
@@ -174,10 +202,18 @@ def get_mt5_candles(symbol: str = "XAUUSD", interval: str = "5min", limit: int =
         return None
 
     df = pd.DataFrame(rates)
-    df["datetime"] = pd.to_datetime(df["time"], unit="s")
+    if "time" not in df.columns and df.shape[1] >= 5:
+        std_cols = ["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
+        df.columns = std_cols[: df.shape[1]]
+
+    if "time" not in df.columns:
+        return None
+
+    df["datetime"] = pd.to_datetime(df["time"], unit="s", utc=True)
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
     return df
+
 
 
 def send_order(

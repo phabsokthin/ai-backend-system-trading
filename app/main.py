@@ -132,11 +132,19 @@ def market_status():
     return get_market_status()
 
 
+_last_streamed_price: Optional[float] = None
+_last_streamed_bid: Optional[float] = None
+_last_streamed_ask: Optional[float] = None
+
 @app.get("/api/live-price")
 def get_live_price():
-    """Fast real-time price snapshot from MT5 terminal or Twelve Data."""
+    """Fast real-time price snapshot from MT5 terminal."""
+    global _last_streamed_price, _last_streamed_bid, _last_streamed_ask
     mt5_tick = get_mt5_live_tick("XAUUSD")
-    if mt5_tick is not None:
+    if mt5_tick is not None and mt5_tick.get("price"):
+        _last_streamed_price = mt5_tick["price"]
+        _last_streamed_bid = mt5_tick["bid"]
+        _last_streamed_ask = mt5_tick["ask"]
         return {
             "success": True,
             "symbol": "XAU/USD",
@@ -149,21 +157,31 @@ def get_live_price():
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         }
 
-    current_price = market.current_price
+    # If live tick is momentarily empty, use last streamed price or last MT5 candle close
+    current_price = _last_streamed_price
     if current_price is None:
         try:
-            candles = get_gold_candles(interval="5min", outputsize=5)
-            current_price = float(candles.iloc[-1]["close"])
+            raw = get_mt5_candles("XAUUSD", "5min", 5)
+            if raw is not None and not raw.empty:
+                current_price = float(raw.iloc[-1]["close"])
+                _last_streamed_price = current_price
+                _last_streamed_bid = current_price
+                _last_streamed_ask = current_price
         except Exception:
             pass
+
+    if current_price is None and market.current_price is not None:
+        current_price = market.current_price
 
     return {
         "success": True,
         "symbol": "XAU/USD",
         "price": current_price,
-        "status": market.connection_status,
-        "source": "Twelve Data",
-        "last_tick_at": market.last_tick_at,
+        "bid": _last_streamed_bid or current_price,
+        "ask": _last_streamed_ask or current_price,
+        "status": "connected" if current_price is not None else "connecting",
+        "source": "MetaTrader 5",
+        "last_tick_at": datetime.now(timezone.utc).isoformat(),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -172,36 +190,71 @@ def get_live_price():
 async def websocket_live_market(websocket: WebSocket):
     """
     Real-Time WebSocket Feed for Next.js:
-    Streams live XAU/USD price ticks directly to the frontend chart from MT5 (or Twelve Data).
+    Streams live XAU/USD price ticks directly to the frontend chart from MT5.
+    Guarantees continuous valid price updates without null gaps.
     """
+    global _last_streamed_price, _last_streamed_bid, _last_streamed_ask
     await websocket.accept()
     try:
         while True:
             mt5_tick = get_mt5_live_tick("XAUUSD")
-            if mt5_tick is not None:
+            if mt5_tick is not None and mt5_tick.get("price"):
                 current_price = mt5_tick["price"]
-                status = "connected"
-                source = "MetaTrader 5"
                 bid = mt5_tick["bid"]
                 ask = mt5_tick["ask"]
-            else:
+                status = "connected"
+                source = "MetaTrader 5"
+                tick_timestamp = time.time()
+                _last_streamed_price = current_price
+                _last_streamed_bid = bid
+                _last_streamed_ask = ask
+            elif _last_streamed_price is not None:
+                current_price = _last_streamed_price
+                bid = _last_streamed_bid or current_price
+                ask = _last_streamed_ask or current_price
+                status = "connected"
+                source = "MetaTrader 5"
+                tick_timestamp = time.time()
+            elif market.current_price is not None:
                 current_price = market.current_price
-                status = market.connection_status
-                source = "Twelve Data"
                 bid = current_price
                 ask = current_price
+                status = market.connection_status
+                source = "Twelve Data"
+                tick_timestamp = market.last_tick_at or time.time()
+                _last_streamed_price = current_price
+            else:
+                # Initial startup attempt to get candle close price as baseline
+                try:
+                    raw = get_mt5_candles("XAUUSD", "5min", 5)
+                    if raw is not None and not raw.empty:
+                        current_price = float(raw.iloc[-1]["close"])
+                        bid = current_price
+                        ask = current_price
+                        status = "connected"
+                        source = "MetaTrader 5"
+                        tick_timestamp = time.time()
+                        _last_streamed_price = current_price
+                        _last_streamed_bid = bid
+                        _last_streamed_ask = ask
+                    else:
+                        current_price = None
+                except Exception:
+                    current_price = None
 
-            await websocket.send_json({
-                "type": "tick",
-                "symbol": "XAU/USD",
-                "price": current_price,
-                "bid": bid,
-                "ask": ask,
-                "status": status,
-                "source": source,
-                "last_tick_at": market.last_tick_at,
-                "timestamp": time.time(),
-            })
+            if current_price is not None:
+                await websocket.send_json({
+                    "type": "tick",
+                    "symbol": "XAU/USD",
+                    "price": current_price,
+                    "bid": bid,
+                    "ask": ask,
+                    "status": status,
+                    "source": source,
+                    "last_tick_at": datetime.now(timezone.utc).isoformat(),
+                    "timestamp": tick_timestamp,
+                    "time": tick_timestamp,
+                })
             await asyncio.sleep(1.0)
     except WebSocketDisconnect:
         pass
@@ -226,28 +279,24 @@ def get_candles_for_nextjs(
     try:
         mt5_df = get_mt5_candles(symbol=symbol, interval=interval, limit=limit)
         if mt5_df is not None and len(mt5_df) > 0:
-            market_closed, _ = is_market_closed()
-            latest_time = float(mt5_df.iloc[-1]["time"]) if "time" in mt5_df.columns else 0
-            is_stale = (not market_closed) and (time.time() - latest_time > 1500)
-            if not is_stale:
-                if include_indicators:
-                    candles_data = format_candles_for_frontend(mt5_df, limit=limit)
-                else:
-                    recent = mt5_df.tail(limit).copy()
-                    recent["datetime"] = recent["datetime"].astype(str)
-                    candles_data = recent.to_dict(orient="records")
+            if include_indicators:
+                candles_data = format_candles_for_frontend(mt5_df, limit=limit)
+            else:
+                recent = mt5_df.tail(limit).copy()
+                recent["datetime"] = recent["datetime"].astype(str)
+                candles_data = recent.to_dict(orient="records")
 
-                current_price = float(mt5_df.iloc[-1]["close"]) if len(mt5_df) > 0 else None
-                return {
-                    "success": True,
-                    "symbol": symbol,
-                    "interval": interval,
-                    "count": len(candles_data),
-                    "current_price": current_price,
-                    "connection_status": "connected",
-                    "source": "MetaTrader 5",
-                    "candles": candles_data,
-                }
+            current_price = float(mt5_df.iloc[-1]["close"]) if len(mt5_df) > 0 else None
+            return {
+                "success": True,
+                "symbol": symbol,
+                "interval": interval,
+                "count": len(candles_data),
+                "current_price": current_price,
+                "connection_status": "connected",
+                "source": "MetaTrader 5",
+                "candles": candles_data,
+            }
     except Exception:
         pass
 

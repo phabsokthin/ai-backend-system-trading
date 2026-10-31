@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import pandas as pd
 
@@ -411,19 +412,27 @@ def format_candles_for_frontend(df: pd.DataFrame, limit: int = 60) -> List[Dict[
 
     candles = []
     for _, row in subset.iterrows():
-        dt_val = row["datetime"]
-        # Convert datetime to Unix timestamp (seconds) and readable ISO/string
-        if hasattr(dt_val, "timestamp"):
-            ts = int(dt_val.timestamp())
-            dt_str = dt_val.strftime("%Y-%m-%d %H:%M:%S")
+        # Prefer exact raw Unix timestamp from MT5 or market data if available
+        if "time" in row and pd.notna(row["time"]) and float(row["time"]) > 0:
+            ts = int(row["time"])
+            dt_str = str(row.get("datetime", ""))
+            if not dt_str or dt_str == "nan":
+                dt_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         else:
-            try:
-                parsed_dt = pd.to_datetime(dt_val)
-                ts = int(parsed_dt.timestamp())
-                dt_str = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                ts = 0
-                dt_str = str(dt_val)
+            dt_val = row["datetime"]
+            if hasattr(dt_val, "tzinfo") and dt_val.tzinfo is None:
+                dt_val = dt_val.replace(tzinfo=timezone.utc)
+            if hasattr(dt_val, "timestamp"):
+                ts = int(dt_val.timestamp())
+                dt_str = dt_val.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                try:
+                    parsed_dt = pd.to_datetime(dt_val, utc=True)
+                    ts = int(parsed_dt.timestamp())
+                    dt_str = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    ts = 0
+                    dt_str = str(dt_val)
 
         candle = {
             "time": ts,

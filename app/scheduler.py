@@ -23,6 +23,10 @@ logging.basicConfig(
 logger = logging.getLogger("gold-scheduler")
 
 LATEST_ANALYSIS: Optional[Dict[str, Any]] = None
+_LAST_RECORDED_CANDLE_TIME: Optional[str] = None
+_LAST_RECORDED_PRICE: Optional[float] = None
+_LAST_RECORDED_ACTION: Optional[str] = None
+_LAST_RECORDED_SIGNAL: Optional[str] = None
 
 
 def get_latest_analysis() -> Optional[Dict[str, Any]]:
@@ -58,23 +62,34 @@ def scheduled_analysis():
         # Fetch 5min entry candles and 1h macro candles
         entry_candles = None
         try:
-            entry_candles = get_gold_candles(interval="5min", outputsize=100)
-        except Exception as e:
-            logger.warning("Twelve Data entry candle fetch failed: %s. Trying MT5...", e)
-            try:
-                from app.mt5_bridge import get_mt5_candles
+            from app.mt5_bridge import get_mt5_candles, ensure_connected
+            if ensure_connected():
                 entry_candles = get_mt5_candles("XAUUSD", "5min", limit=100)
-            except Exception:
-                pass
+        except Exception as e:
+            logger.warning("MT5 entry candle fetch failed: %s", e)
 
         if entry_candles is None or len(entry_candles) == 0:
-            raise RuntimeError("Could not fetch entry candles from Twelve Data or MT5")
+            try:
+                entry_candles = get_gold_candles(interval="5min", outputsize=100)
+            except Exception as e:
+                logger.warning("Twelve Data entry candle fetch failed: %s", e)
+
+        if entry_candles is None or len(entry_candles) == 0:
+            raise RuntimeError("Could not fetch entry candles from MT5 or Twelve Data")
 
         htf_candles = None
         try:
-            htf_candles = get_gold_candles(interval="1h", outputsize=100)
+            from app.mt5_bridge import get_mt5_candles, ensure_connected
+            if ensure_connected():
+                htf_candles = get_mt5_candles("XAUUSD", "1h", limit=100)
         except Exception as e:
-            logger.warning("Could not fetch 1h HTF candles: %s", e)
+            logger.warning("MT5 HTF candle fetch failed: %s", e)
+
+        if htf_candles is None or len(htf_candles) == 0:
+            try:
+                htf_candles = get_gold_candles(interval="1h", outputsize=100)
+            except Exception as e:
+                logger.warning("Could not fetch 1h HTF candles: %s", e)
 
         # Technical multi-timeframe signal & Support/Resistance
         technical = generate_multi_timeframe_signal(
@@ -181,8 +196,11 @@ def scheduled_analysis():
             else:
                 has_setup = False
 
+        current_candle_time = str(entry_candles.iloc[-1]["datetime"]) if "datetime" in entry_candles.columns else started_at
+
         result = {
             "timestamp_utc": started_at,
+            "candle_time": current_candle_time,
             "symbol": "XAU/USD",
             "entry_timeframe": "5min",
             "analysis_timeframe": "1h",
@@ -214,17 +232,42 @@ def scheduled_analysis():
             "real_orders_enabled": False,
         }
 
+        global _LAST_RECORDED_CANDLE_TIME, _LAST_RECORDED_PRICE, _LAST_RECORDED_ACTION, _LAST_RECORDED_SIGNAL
+
+        trade_action = trade_exec.get("action", "")
+        is_action_change = trade_exec.get("is_new_entry") or (trade_action and str(trade_action).startswith("CLOSE"))
+        is_new_candle = (_LAST_RECORDED_CANDLE_TIME is None) or (_LAST_RECORDED_CANDLE_TIME != current_candle_time)
+        price_moved = (_LAST_RECORDED_PRICE is None) or (abs(float(price or 0) - float(_LAST_RECORDED_PRICE or 0)) >= 0.50)
+        signal_changed = (_LAST_RECORDED_SIGNAL is None) or (_LAST_RECORDED_SIGNAL != signal)
+        action_changed = (_LAST_RECORDED_ACTION is None) or (_LAST_RECORDED_ACTION != trade_action)
+
+        should_record_new_snapshot = is_action_change or is_new_candle or price_moved or signal_changed or action_changed
+
         LATEST_ANALYSIS = result
 
-        with LOG_FILE.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(result, default=str) + "\n")
+        if should_record_new_snapshot:
+            with LOG_FILE.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(result, default=str) + "\n")
 
-        # Store analysis result in MongoDB
-        try:
-            from app.mongo_db import save_analysis
-            save_analysis(result)
-        except Exception as mongo_err:
-            logger.debug("MongoDB analysis storage skipped: %s", mongo_err)
+            _LAST_RECORDED_CANDLE_TIME = current_candle_time
+            _LAST_RECORDED_PRICE = price
+            _LAST_RECORDED_ACTION = trade_action
+            _LAST_RECORDED_SIGNAL = signal
+
+            # Store analysis result in MongoDB
+            try:
+                from app.mongo_db import save_analysis
+                save_analysis(result, update_only=False)
+            except Exception as mongo_err:
+                logger.debug("MongoDB analysis storage skipped: %s", mongo_err)
+        else:
+            # Duplicate cycle: update MongoDB latest record in-place without adding duplicate row
+            try:
+                from app.mongo_db import save_analysis
+                save_analysis(result, update_only=True)
+            except Exception as mongo_err:
+                logger.debug("MongoDB analysis update skipped: %s", mongo_err)
+            logger.info("Analysis duplicate of candle %s; updated latest state without duplicate row.", current_candle_time)
 
         logger.info(
             "Analysis complete: action=%s signal=%s is_new_entry=%s price=%s TP=%s SL=%s duplicate_prevented=%s msg=%s",
@@ -243,3 +286,4 @@ def scheduled_analysis():
     except Exception:
         logger.exception("Scheduled analysis failed; no trade was placed")
         return None
+

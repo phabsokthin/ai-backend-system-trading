@@ -57,9 +57,10 @@ def check_mongodb() -> Dict[str, Any]:
         }
 
 
-def save_analysis(analysis_data: Dict[str, Any]) -> Optional[str]:
+def save_analysis(analysis_data: Dict[str, Any], update_only: bool = False) -> Optional[str]:
     """
     Store analysis result in MongoDB 'analysis' collection without duplicates.
+    Deduplicates by candle_time and consecutive identical market states.
     When a brand-new entry is confirmed (is_new_entry == True), stores the setup
     in 'signals' collection exactly once.
     """
@@ -69,6 +70,8 @@ def save_analysis(analysis_data: Dict[str, Any]) -> Optional[str]:
     try:
         doc = dict(analysis_data)
         timestamp_utc = doc.get("timestamp_utc")
+        candle_time = doc.get("candle_time")
+        symbol = doc.get("symbol", "XAU/USD")
 
         # Guarantee current_price and price are synchronized
         if "current_price" not in doc and "price" in doc:
@@ -85,29 +88,40 @@ def save_analysis(analysis_data: Dict[str, Any]) -> Optional[str]:
                 else doc.get("message", "Market analysis evaluated")
             )
 
-        # Deduplicate analysis records: check if an analysis with this exact timestamp exists,
-        # or if one was already recorded for the same symbol within a 3-minute window
-        if timestamp_utc:
-            existing = None
-            try:
-                clean_ts = str(timestamp_utc).replace("Z", "+00:00")
-                parsed_dt = datetime.fromisoformat(clean_ts)
-                start_w = parsed_dt - timedelta(minutes=3)
-                end_w = parsed_dt + timedelta(minutes=3)
-                existing = analysis_collection.find_one({
-                    "$or": [
-                        {"timestamp_utc": timestamp_utc},
-                        {
-                            "symbol": doc.get("symbol", "XAU/USD"),
-                            "created_at": {"$gte": start_w, "$lte": end_w}
-                        }
-                    ]
-                })
-            except Exception:
-                existing = analysis_collection.find_one({"timestamp_utc": timestamp_utc})
+        # 1. If update_only requested, update the most recent document for this symbol in-place
+        if update_only:
+            latest = analysis_collection.find_one({"symbol": symbol}, sort=[("timestamp_utc", -1), ("_id", -1)])
+            if latest:
+                analysis_collection.update_one({"_id": latest["_id"]}, {"$set": doc})
+                return str(latest["_id"])
 
+        # 2. Deduplicate by candle_time if provided
+        if candle_time:
+            existing_candle = analysis_collection.find_one({"symbol": symbol, "candle_time": candle_time})
+            if existing_candle:
+                analysis_collection.update_one({"_id": existing_candle["_id"]}, {"$set": doc})
+                return str(existing_candle["_id"])
+
+        # 3. Deduplicate exact consecutive state: if the latest analysis has same price, signal, action, and trend
+        if not doc.get("is_new_entry") and not str(doc.get("action", "")).startswith("CLOSE"):
+            latest = analysis_collection.find_one({"symbol": symbol}, sort=[("timestamp_utc", -1), ("_id", -1)])
+            if latest and not latest.get("is_new_entry"):
+                latest_p = round(float(latest.get("current_price") or latest.get("price") or 0), 2)
+                doc_p = round(float(doc.get("current_price") or doc.get("price") or 0), 2)
+                latest_sig = latest.get("signal")
+                doc_sig = doc.get("signal")
+                latest_act = latest.get("action")
+                doc_act = doc.get("action")
+
+                if latest_p == doc_p and latest_sig == doc_sig and latest_act == doc_act:
+                    # Update latest record instead of creating duplicate snapshot
+                    analysis_collection.update_one({"_id": latest["_id"]}, {"$set": doc})
+                    return str(latest["_id"])
+
+        # 4. Check exact timestamp
+        if timestamp_utc:
+            existing = analysis_collection.find_one({"timestamp_utc": timestamp_utc, "symbol": symbol})
             if existing:
-                # Update existing analysis in-place with latest metrics rather than creating a duplicate
                 analysis_collection.update_one({"_id": existing["_id"]}, {"$set": doc})
                 return str(existing["_id"])
 
@@ -159,7 +173,7 @@ def get_latest_analysis_from_db() -> Optional[Dict[str, Any]]:
     if analysis_collection is None:
         return None
     try:
-        doc = analysis_collection.find_one(sort=[("_id", -1)])
+        doc = analysis_collection.find_one(sort=[("timestamp_utc", -1), ("_id", -1)])
         if doc and "_id" in doc:
             doc["_id"] = str(doc["_id"])
             if isinstance(doc.get("created_at"), datetime):
@@ -171,13 +185,20 @@ def get_latest_analysis_from_db() -> Optional[Dict[str, Any]]:
 
 
 def get_analysis_history(limit: int = 50) -> List[Dict[str, Any]]:
-    """Retrieve historical analysis records from MongoDB ordered DESC (newest first), deduplicated by 5m candle."""
+    """
+    Retrieve historical analysis records from MongoDB ordered DESC (newest first).
+    Deduplicates both by candle timestamp slot and removes consecutive identical duplicate rows.
+    """
     if analysis_collection is None:
         return []
     try:
-        cursor = analysis_collection.find().sort([("timestamp_utc", -1), ("_id", -1)]).limit(limit * 2)
+        cursor = analysis_collection.find().sort([("timestamp_utc", -1), ("_id", -1)]).limit(limit * 4)
         results = []
         seen_candle_slots = set()
+
+        last_p: Optional[float] = None
+        last_trend: Optional[str] = None
+        last_sig: Optional[str] = None
 
         for doc in cursor:
             if "_id" in doc:
@@ -193,21 +214,41 @@ def get_analysis_history(limit: int = 50) -> List[Dict[str, Any]]:
             if not doc.get("reason"):
                 doc["reason"] = doc.get("message") or "Analysis completed"
 
-            # Deduplicate by 5-minute candle block
-            ts_str = doc.get("timestamp_utc") or doc.get("created_at") or ""
-            candle_slot = None
-            if ts_str:
-                try:
-                    dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
-                    minute_slot = (dt.minute // 5) * 5
-                    candle_slot = f"{dt.year}_{dt.month}_{dt.day}_{dt.hour}_{minute_slot}_{doc.get('symbol', 'XAU/USD')}"
-                except Exception:
-                    candle_slot = ts_str
+            p_val = round(float(doc.get("current_price") or doc.get("price") or 0), 2)
+            trend_val = str((doc.get("multi_timeframe") or {}).get("htf_trend") or "")
+            sig_val = str(doc.get("signal") or "")
+            act_val = str(doc.get("action") or "")
+            is_entry = bool(doc.get("is_new_entry"))
+            is_close = act_val.startswith("CLOSE")
+
+            # Consecutive identical state suppression (collapse multiple identical rows)
+            if not is_entry and not is_close:
+                if last_p is not None and last_p == p_val and last_trend == trend_val and last_sig == sig_val:
+                    continue
+
+            # Deduplicate by candle time or 5-minute candle block
+            candle_time = doc.get("candle_time")
+            if candle_time:
+                candle_slot = f"{candle_time}_{doc.get('symbol', 'XAU/USD')}"
+            else:
+                ts_str = doc.get("timestamp_utc") or doc.get("created_at") or ""
+                candle_slot = None
+                if ts_str:
+                    try:
+                        dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+                        minute_slot = (dt.minute // 5) * 5
+                        candle_slot = f"{dt.year}_{dt.month}_{dt.day}_{dt.hour}_{minute_slot}_{doc.get('symbol', 'XAU/USD')}"
+                    except Exception:
+                        candle_slot = ts_str
 
             if candle_slot and candle_slot in seen_candle_slots:
                 continue
             if candle_slot:
                 seen_candle_slots.add(candle_slot)
+
+            last_p = p_val
+            last_trend = trend_val
+            last_sig = sig_val
 
             results.append(doc)
             if len(results) >= limit:

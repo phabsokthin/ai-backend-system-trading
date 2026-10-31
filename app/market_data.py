@@ -40,6 +40,8 @@ def get_gold_candles(interval: str = "5min", outputsize: int = 100, use_cache: b
     # Determine TTL: shorter for lower timeframe, longer for higher timeframe
     ttl_seconds = 45 if api_interval in ("5min", "15min") else 120
 
+    MAX_FALLBACK_STALENESS = 900  # 15 minutes max fallback to prevent day-old candles
+
     if use_cache and cache_key in _CANDLE_CACHE:
         cached_entry = _CANDLE_CACHE[cache_key]
         if now - cached_entry["timestamp"] < ttl_seconds:
@@ -47,9 +49,11 @@ def get_gold_candles(interval: str = "5min", outputsize: int = 100, use_cache: b
 
     api_key = os.getenv("TWELVE_DATA_API_KEY")
     if not api_key:
-        # If cache exists even if expired, fallback to it
+        # If cache exists and is fresh enough, fallback to it
         if cache_key in _CANDLE_CACHE:
-            return _CANDLE_CACHE[cache_key]["data"].copy()
+            cached_entry = _CANDLE_CACHE[cache_key]
+            if now - cached_entry["timestamp"] <= MAX_FALLBACK_STALENESS:
+                return cached_entry["data"].copy()
         raise RuntimeError("Missing TWELVE_DATA_API_KEY in .env")
 
     try:
@@ -68,9 +72,11 @@ def get_gold_candles(interval: str = "5min", outputsize: int = 100, use_cache: b
         data = response.json()
 
         if "values" not in data:
-            # If rate-limited or error, fallback to cache if available
+            # If rate-limited or error, fallback to cache ONLY if recent (< 15 mins)
             if cache_key in _CANDLE_CACHE:
-                return _CANDLE_CACHE[cache_key]["data"].copy()
+                cached_entry = _CANDLE_CACHE[cache_key]
+                if now - cached_entry["timestamp"] <= MAX_FALLBACK_STALENESS:
+                    return cached_entry["data"].copy()
             raise RuntimeError(data.get("message", "No candle data returned"))
 
         df = pd.DataFrame(data["values"])
@@ -90,7 +96,9 @@ def get_gold_candles(interval: str = "5min", outputsize: int = 100, use_cache: b
         min_required = 20 if api_interval in ("1day", "4h") else 30
         if len(df) < min_required:
             if cache_key in _CANDLE_CACHE:
-                return _CANDLE_CACHE[cache_key]["data"].copy()
+                cached_entry = _CANDLE_CACHE[cache_key]
+                if now - cached_entry["timestamp"] <= MAX_FALLBACK_STALENESS:
+                    return cached_entry["data"].copy()
             raise RuntimeError(f"Not enough valid candles for {api_interval} (got {len(df)})")
 
         _CANDLE_CACHE[cache_key] = {
@@ -101,7 +109,9 @@ def get_gold_candles(interval: str = "5min", outputsize: int = 100, use_cache: b
         return df
 
     except Exception as exc:
-        # Fallback to expired cache if available to avoid crashing during temporary spikes
+        # Fallback to cache ONLY if within 15 minutes to avoid returning stale data from previous day
         if cache_key in _CANDLE_CACHE:
-            return _CANDLE_CACHE[cache_key]["data"].copy()
+            cached_entry = _CANDLE_CACHE[cache_key]
+            if now - cached_entry["timestamp"] <= MAX_FALLBACK_STALENESS:
+                return cached_entry["data"].copy()
         raise exc
