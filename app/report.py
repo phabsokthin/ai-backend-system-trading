@@ -240,25 +240,43 @@ def generate_trading_report(trade_limit: int = 100) -> Dict[str, Any]:
                 "exit_reason": t.get("exit_reason"),
             })
 
-        # 5. Extract upcoming news if available
+        # 5. Extract upcoming news for TODAY ONLY
         upcoming_news: List[Dict[str, Any]] = []
-        from app.news_filter import get_events_file
-        news_file = get_events_file()
-        if news_file.exists():
-            try:
+        news_analysis_data: Optional[Dict[str, Any]] = None
+        try:
+            from app.news_filter import get_detailed_news_analysis, get_events_file
+            detailed_news = get_detailed_news_analysis()
+            news_analysis_data = detailed_news
+
+            news_file = get_events_file()
+            if news_file.exists():
                 raw_json = json.loads(news_file.read_text(encoding="utf-8"))
                 events_list = raw_json.get("events") if isinstance(raw_json, dict) else (raw_json if isinstance(raw_json, list) else [])
+                today_utc_date = datetime.now(timezone.utc).date()
                 if isinstance(events_list, list):
-                    for evt in events_list[:6]:
+                    for evt in events_list:
+                        # STRICT FILTER: Show only today's news
+                        evt_raw_time = evt.get("time") or evt.get("date")
+                        if evt_raw_time:
+                            try:
+                                evt_d = datetime.fromisoformat(str(evt_raw_time).replace("Z", "+00:00")).date()
+                                if evt_d != today_utc_date:
+                                    continue
+                            except Exception:
+                                pass
+
                         upcoming_news.append({
                             "time": evt.get("time") or evt.get("date", "Today"),
                             "currency": evt.get("currency") or evt.get("country", "USD"),
                             "impact": str(evt.get("impact", "HIGH")).upper(),
                             "title": evt.get("title") or evt.get("name", "High Impact Event"),
                             "forecast": f"F: {evt.get('forecast')}" if evt.get('forecast') else (evt.get("previous") or "High Volatility"),
+                            "previous": evt.get("previous"),
+                            "actual": evt.get("actual"),
+                            "all_day": evt.get("all_day", False),
                         })
-            except Exception as e:
-                logger.warning("Could not read events.json for report: %s", e)
+        except Exception as e:
+            logger.warning("Could not read news data for report: %s", e)
 
         report = {
             "success": True,
@@ -285,6 +303,7 @@ def generate_trading_report(trade_limit: int = 100) -> Dict[str, Any]:
             },
             "recent_trades": formatted_recent,
             "upcoming_news": upcoming_news,
+            "news_analysis": news_analysis_data,
         }
         return report
 

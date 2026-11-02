@@ -1,16 +1,68 @@
 {
   "verified": true,
-  "updated_at": "2026-10-16T07:26:33.884379+00:00",
-  "source": "http://127.0.0.1:3000/api/v1/high-impact",
-  "source_date": "2026-10-16",
-  "source_timestamp": "2026-10-16T07:26:33.879Z",
+  "updated_at": "2026-11-02T10:07:03.749522+00:00",
+  "source": "https://news-forex.netlify.app/api/high-impact",
+  "date_queried": "2026-11-02",
   "timezone_used": "Asia/Phnom_Penh",
+  "scope": "today_only",
+  "total_events": 4,
+  "total_usd_events": 0,
   "events": [
     {
-      "name": "Fed Chairman Warsh Speaks",
-      "currency": "USD",
-      "time": "2026-10-15T18:00:00+00:00",
-      "impact": "high"
+      "name": "Cash Rate",
+      "title": "Cash Rate",
+      "currency": "AUD",
+      "time": "2026-11-02T14:30:00+00:00",
+      "date": "2026-11-02",
+      "impact": "high",
+      "impact_score": 3,
+      "all_day": false,
+      "raw_time": "9:30pm",
+      "forecast": "4.85%",
+      "previous": "4.60%",
+      "actual": null
+    },
+    {
+      "name": "RBA Monetary Policy Statement",
+      "title": "RBA Monetary Policy Statement",
+      "currency": "AUD",
+      "time": "2026-11-02T14:30:00+00:00",
+      "date": "2026-11-02",
+      "impact": "high",
+      "impact_score": 3,
+      "all_day": false,
+      "raw_time": "9:30pm",
+      "forecast": null,
+      "previous": null,
+      "actual": null
+    },
+    {
+      "name": "RBA Rate Statement",
+      "title": "RBA Rate Statement",
+      "currency": "AUD",
+      "time": "2026-11-02T14:30:00+00:00",
+      "date": "2026-11-02",
+      "impact": "high",
+      "impact_score": 3,
+      "all_day": false,
+      "raw_time": "9:30pm",
+      "forecast": null,
+      "previous": null,
+      "actual": null
+    },
+    {
+      "name": "RBA Press Conference",
+      "title": "RBA Press Conference",
+      "currency": "AUD",
+      "time": "2026-11-02T15:30:00+00:00",
+      "date": "2026-11-02",
+      "impact": "high",
+      "impact_score": 3,
+      "all_day": false,
+      "raw_time": "10:30pm",
+      "forecast": null,
+      "previous": null,
+      "actual": null
     }
   ]
 }

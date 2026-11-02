@@ -17,11 +17,12 @@ from app.indicators import (
     analyze_timeframe_trend,
     format_candles_for_frontend,
 )
-from app.news_filter import check_news_filter
+from app.news_filter import check_news_filter, get_detailed_news_analysis
 from app.ai_commentary import get_ai_commentary
 from app.risk import calculate_risk_levels
 from app.scheduler import scheduled_analysis, get_latest_analysis
 from app.news_fetcher import refresh_news_calendar
+from app.mongo_db import save_news_analysis_to_db, get_latest_news_from_db
 from app.trade_manager import (
     process_trade_signal,
     load_active_trade,
@@ -63,14 +64,22 @@ scheduler = BackgroundScheduler(timezone="UTC")
 
 
 @app.on_event("startup")
-
 def start_background_scheduler():
     # Initial news calendar fetch
-    
     try:
         refresh_news_calendar()
         market.start()
-
+        try:
+            detailed = get_detailed_news_analysis()
+            save_news_analysis_to_db(detailed)
+        except Exception:
+            pass
+        # Seed recent historical news in MongoDB for previous news comparison
+        try:
+            from app.news_fetcher import sync_historical_news_events
+            sync_historical_news_events(days_back=7)
+        except Exception:
+            pass
         print("Economic news calendar initialized successfully")
     except Exception as e:
         print(f"Warning: Initial news refresh encountered an issue: {e}")
@@ -631,11 +640,13 @@ def gold_analysis(
             "real_orders_enabled": False,
         }
 
-        # Store analysis result in MongoDB only if there is a new confirmed entry
-        if payload.get("is_new_entry"):
+        # Store analysis result and confirmed signals in MongoDB
+        if payload.get("is_new_entry") or payload.get("signal") in ("BUY", "SELL") or payload.get("has_setup"):
             try:
-                from app.mongo_db import save_analysis
+                from app.mongo_db import save_analysis, save_signal_to_db
                 save_analysis(payload)
+                if payload.get("signal") in ("BUY", "SELL"):
+                    save_signal_to_db(payload)
             except Exception:
                 pass
 
@@ -918,6 +929,8 @@ def gold_multi_timeframe_overview():
         )
 
 
+@app.get("/api/news")
+@app.get("/api/news/calendar")
 @app.get("/news/calendar")
 def news_calendar():
     """Retrieve verified economic news calendar and impact assessment."""
@@ -925,17 +938,116 @@ def news_calendar():
     return news
 
 
+@app.get("/api/news/analysis")
+@app.get("/news/analysis")
+def news_analysis_endpoint():
+    """Retrieve detailed economic news analysis, volatility risk, and key Gold catalysts."""
+    try:
+        detailed = get_detailed_news_analysis()
+        try:
+            save_news_analysis_to_db(detailed)
+        except Exception:
+            pass
+        return detailed
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"News analysis generation failed: {exc}",
+        )
+
+
+@app.post("/api/news/refresh")
 @app.post("/news/refresh")
+@app.post("/api/news/update")
+@app.post("/news/update")
 def news_refresh():
-    """Force an immediate refresh of the economic news calendar from XOOMAR."""
+    """Force an immediate refresh of the economic news calendar from Forex Factory and recompute analysis."""
     try:
         res = refresh_news_calendar()
-        return res
+        detailed = get_detailed_news_analysis()
+        try:
+            save_news_analysis_to_db(detailed)
+        except Exception:
+            pass
+        return {
+            "success": True,
+            "message": "Economic news calendar and analysis refreshed successfully",
+            "calendar": res,
+            "news_analysis": detailed,
+        }
     except Exception as exc:
         raise HTTPException(
             status_code=502,
             detail=f"News calendar refresh failed: {exc}",
         )
+
+
+@app.get("/api/news/comparison")
+@app.get("/news/comparison")
+def news_comparison_endpoint():
+    """Retrieve deep comparative analysis of current news events against previous historical releases."""
+    try:
+        detailed = get_detailed_news_analysis()
+        comparison = detailed.get("previous_news_comparison") or {}
+        return {
+            "success": True,
+            "date": detailed.get("date"),
+            "timestamp_utc": detailed.get("timestamp_utc"),
+            "comparison": comparison,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"News comparison failed: {exc}")
+
+
+@app.get("/api/news/history")
+@app.get("/news/history")
+@app.get("/api/news/events")
+@app.get("/news/events")
+def get_news_history_endpoint(
+    date: Optional[str] = Query(None, description="Filter by YYYY-MM-DD"),
+    currency: Optional[str] = Query(None, description="Filter by currency e.g. USD"),
+    impact: Optional[str] = Query(None, description="Filter by impact level e.g. high"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """Retrieve historical economic news events stored in MongoDB."""
+    from app.mongo_db import get_news_events_from_db
+    events = get_news_events_from_db(date=date, currency=currency, impact=impact, limit=limit)
+    return {
+        "success": True,
+        "count": len(events),
+        "events": events,
+    }
+
+
+@app.get("/api/news/events/{title:path}")
+@app.get("/news/events/{title:path}")
+def get_event_releases_endpoint(
+    title: str,
+    currency: str = Query("USD", description="Currency symbol e.g. USD, AUD"),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """Retrieve historical releases and track previous actual vs forecast for a specific event."""
+    from app.mongo_db import get_previous_events_for_event
+    records = get_previous_events_for_event(title=title, currency=currency, limit=limit)
+    return {
+        "success": True,
+        "title": title,
+        "currency": currency,
+        "count": len(records),
+        "releases": records,
+    }
+
+
+@app.post("/api/news/sync-history")
+@app.post("/news/sync-history")
+def sync_news_history_endpoint(days_back: int = Query(7, ge=1, le=30)):
+    """Sync previous days of economic news into MongoDB for historical analysis."""
+    from app.news_fetcher import sync_historical_news_events
+    res = sync_historical_news_events(days_back=days_back)
+    return {
+        "success": True,
+        "result": res,
+    }
 
 
 @app.get("/api/analysis/latest")
@@ -1010,6 +1122,9 @@ def get_mongodb_status():
                 "signals": db["signals"].count_documents({}),
                 "trades": db["trades"].count_documents({}),
                 "candles": db["candles"].count_documents({}),
+                "news": db["news"].count_documents({}),
+                "news_events": db["news_events"].count_documents({}),
+                "news_analysis": db["news_analysis"].count_documents({}),
             }
         except Exception as e:
             status["collections_error"] = str(e)

@@ -256,15 +256,19 @@ def scheduled_analysis():
 
             # Store analysis result in MongoDB
             try:
-                from app.mongo_db import save_analysis
+                from app.mongo_db import save_analysis, save_signal_to_db
                 save_analysis(result, update_only=False)
+                if signal in ("BUY", "SELL"):
+                    save_signal_to_db(result)
             except Exception as mongo_err:
                 logger.debug("MongoDB analysis storage skipped: %s", mongo_err)
         else:
             # Duplicate cycle: update MongoDB latest record in-place without adding duplicate row
             try:
-                from app.mongo_db import save_analysis
+                from app.mongo_db import save_analysis, save_signal_to_db
                 save_analysis(result, update_only=True)
+                if signal in ("BUY", "SELL"):
+                    save_signal_to_db(result)
             except Exception as mongo_err:
                 logger.debug("MongoDB analysis update skipped: %s", mongo_err)
             logger.info("Analysis duplicate of candle %s; updated latest state without duplicate row.", current_candle_time)

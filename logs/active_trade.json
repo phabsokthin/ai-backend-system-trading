@@ -1,16 +1,16 @@
 {
-  "id": "trade_20261031_075154",
+  "id": "trade_20261102_064500",
   "direction": "SELL",
-  "entry_price": 3875.703,
-  "stop_loss": 3886.343,
-  "take_profit": 3854.424,
-  "sl": 3886.343,
-  "tp": 3854.424,
-  "tp1": 3859.744,
-  "tp2": 3854.424,
-  "tp3": 3843.784,
+  "entry_price": 3904.747,
+  "stop_loss": 3919.004,
+  "take_profit": 3876.233,
+  "sl": 3919.004,
+  "tp": 3876.233,
+  "tp1": 3883.361,
+  "tp2": 3876.233,
+  "tp3": 3861.976,
   "timeframe": "5min",
-  "entry_time": "2026-10-31T07:51:54.765334+00:00",
+  "entry_time": "2026-11-02T06:45:00.529689+00:00",
   "status": "OPEN",
-  "entry_reason": "Strong bearish confluence: HTF (1h) trend is BEARISH; Entry (5min) EMA9 (3876.42) < EMA21 (3878.05); RSI (44.86) confirms downward momentum"
+  "entry_reason": "Strong bearish confluence: HTF (1h) trend is BEARISH; Entry (5min) EMA9 (3908.98) < EMA21 (3909.25); RSI (40.9) confirms downward momentum"
 }
